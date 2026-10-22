@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck oct2026-scan.sh tests/run.sh
+        run: shellcheck -x oct2026-scan.sh tests/run.sh
       - name: unit tests (dpkg comparisons)
         run: bash tests/run.sh
       - name: unit tests (awk comparisons)

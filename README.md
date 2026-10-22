@@ -115,7 +115,7 @@ Fix data lives in `FIXED_DATA` near the top of `oct2026-scan.sh`. A new row need
 
 ```bash
 bash tests/run.sh
-shellcheck oct2026-scan.sh tests/run.sh
+shellcheck -x oct2026-scan.sh tests/run.sh
 ```
 
 ## License

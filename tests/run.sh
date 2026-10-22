@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Unit tests for oct2026-scan.sh evaluators. No dependencies: bash tests/run.sh
+# `cond && ok || bad` is intentional throughout: ok never fails.
+# shellcheck disable=SC2015
 set -u
 cd "$(dirname "$0")/.." || exit 1
-# shellcheck source=../oct2026-scan.sh
+# shellcheck source=oct2026-scan.sh
 . ./oct2026-scan.sh
 
 PASS=0
@@ -159,9 +161,10 @@ plexso=/config/Library/Application Support/Plex Media Server/Codecs/x.so"
 
 # --- JSON escaping and exit code ---
 [ "$(json_str 'a"b\c')" = '"a\"b\\c"' ] && ok || bad "json_str: $(json_str 'a"b\c')"
-reset; add CRIT OK x y; exit_code; [ $? = 0 ] && ok || bad "exit 0"
-reset; add CRIT CHECK x y; exit_code; [ $? = 1 ] && ok || bad "exit 1"
-reset; add CRIT CHECK x y; add CRIT IOC x y; exit_code; [ $? = 2 ] && ok || bad "exit 2"
+expect_exit() { local rc=0; exit_code || rc=$?; [ "$rc" = "$1" ] && ok || bad "exit code: want $1, got $rc"; }
+reset; add CRIT OK x y; expect_exit 0
+reset; add CRIT CHECK x y; expect_exit 1
+reset; add CRIT CHECK x y; add CRIT IOC x y; expect_exit 2
 
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" = 0 ]

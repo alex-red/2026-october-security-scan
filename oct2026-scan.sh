@@ -111,6 +111,9 @@ parse_args() {
 # ---------------------------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# oneline TEXT: join lines/whitespace runs into one space-separated line (no glob expansion)
+oneline() { printf '%s\n' "$1" | tr -s ' \t\n' '   ' | sed 's/^ //; s/ $//'; }
+
 # Debian version comparison (dpkg algorithm) in awk; used when dpkg is absent.
 # Prints -1, 0 or 1.
 vcmp_awk() {
@@ -225,6 +228,7 @@ PLEX_SEEN=0
 detect_env() {
 	[ "$(id -u)" = 0 ] && IS_ROOT=1
 	OS_PRETTY=$(uname -s)
+	# shellcheck disable=SC1091 # /etc/os-release is read on the scanned host
 	if [ -r /etc/os-release ]; then
 		local id like cn ucn pretty
 		id=$(. /etc/os-release; printf '%s' "${ID:-unknown}")
@@ -493,7 +497,7 @@ check_php() {
 		extra=""
 		[ "${F_STAT[$((${#F_STAT[@]} - 1))]}" = VULNERABLE ] && [ "$mitig" = off ] &&
 			extra="session.upload_progress disabled (partial mitigation only)"
-		[ -n "$extra" ] && F_DETAIL[$((${#F_DETAIL[@]} - 1))]="${F_DETAIL[$((${#F_DETAIL[@]} - 1))]}; $extra"
+		[ -n "$extra" ] && F_DETAIL[${#F_DETAIL[@]} - 1]="${F_DETAIL[$((${#F_DETAIL[@]} - 1))]}; $extra"
 	done <<EOF
 $(src_versions '^php[0-9]+(\.[0-9]+)?$')
 EOF
@@ -521,7 +525,7 @@ EOF
 php_upload_progress() {
 	local val
 	val=$(cat /etc/php/"$1"/*/php.ini /etc/php/"$1"/*/conf.d/*.ini 2>/dev/null |
-		sed -n 's/^[[:space:]]*session\.upload_progress\.enabled[[:space:]]*=[[:space:]]*\([A-Za-z0-9"]*\).*/\1/p' | tail -n1 | tr -d '"' | tr 'A-Z' 'a-z')
+		sed -n 's/^[[:space:]]*session\.upload_progress\.enabled[[:space:]]*=[[:space:]]*\([A-Za-z0-9"]*\).*/\1/p' | tail -n1 | tr -d '"' | tr '[:upper:]' '[:lower:]')
 	case $val in off | 0 | false | no) echo off ;; *) echo on ;; esac
 }
 
@@ -542,6 +546,7 @@ check_nginx() {
 		conf=$(timeout 10 "$bin" -T 2>/dev/null | sed 's/#.*//')
 		if [ -n "$conf" ]; then
 			printf '%s\n' "$conf" | grep -qE '^[[:space:]]*alias[[:space:]]' &&
+				# shellcheck disable=SC2016 # literal nginx variable name
 				printf '%s\n' "$conf" | grep -qE '^[[:space:]]*rewrite[[:space:]]|\$request_filename' && risky="$risky alias+rewrite"
 			printf '%s\n' "$conf" | grep -qE '^[[:space:]]*aio[[:space:]]+(on|threads)' &&
 				printf '%s\n' "$conf" | grep -qE '^[[:space:]]*ssi[[:space:]]+on' && risky="$risky aio+ssi"
@@ -593,12 +598,12 @@ check_plex_children() {
 	local pids odd
 	pids=$(printf '%s\n' "$PS_OUT" | awk '/Plex Media Server/ && !/awk/ { print $1 }')
 	[ -n "$pids" ] || return 0
-	odd=$(printf '%s\n' "$PS_OUT" | awk -v pids=" $(echo $pids) " '
+	odd=$(printf '%s\n' "$PS_OUT" | awk -v pids=" $(oneline "$pids") " '
 		index(pids, " " $2 " ") {
 			cmd = ""; for (i = 4; i <= NF; i++) cmd = cmd (i > 4 ? " " : "") $i
 			if (cmd !~ /Plex|EasyAudioEncoder/) print $1 ":" substr(cmd, 1, 60)
 		}')
-	[ -n "$odd" ] && add CRIT IOC "Plex child processes" "unexpected processes spawned by Plex: $(echo $odd)" plex_ioc
+	[ -n "$odd" ] && add CRIT IOC "Plex child processes" "unexpected processes spawned by Plex: $(oneline "$odd")" plex_ioc
 	return 0
 }
 
@@ -627,7 +632,7 @@ check_kernel() {
 				for best in $pkgs; do vge "$best" "$fx" && reboot="linux-image $best" && break; done
 			fi
 		fi
-		[ -n "$reboot" ] && F_DETAIL[$((${#F_DETAIL[@]} - 1))]="${F_DETAIL[$((${#F_DETAIL[@]} - 1))]}; fixed $reboot is installed — reboot into it"
+		[ -n "$reboot" ] && F_DETAIL[${#F_DETAIL[@]} - 1]="${F_DETAIL[$((${#F_DETAIL[@]} - 1))]}; fixed $reboot is installed — reboot into it"
 	fi
 	[ -e /var/run/reboot-required ] && add INFO CHECK "Reboot" "/var/run/reboot-required exists — pending updates need a reboot" kernel_reboot
 	return 0
@@ -643,9 +648,9 @@ check_nextcloud_host() {
 		ver=$(sed -n 's:.*<version>\([^<]*\)</version>.*:\1:p' "$f" | head -n1)
 		eval_nextcloud_code "host $dir" "$ver"
 		shx=$(find "$dir" -name 'shx*.php' 2>/dev/null | head -n5)
-		[ -n "$shx" ] && add CRIT IOC "Nextcloud CODE webshell" "$(echo $shx)" nextcloud_ioc
+		[ -n "$shx" ] && add CRIT IOC "Nextcloud CODE webshell" "$(oneline "$shx")" nextcloud_ioc
 		newer=$(find "$dir" -name '*.php' -newer "$f" 2>/dev/null | head -n5)
-		[ -n "$newer" ] && add HIGH CHECK "Nextcloud CODE files" "PHP files modified after the app was installed: $(echo $newer)" nextcloud_ioc
+		[ -n "$newer" ] && add HIGH CHECK "Nextcloud CODE files" "PHP files modified after the app was installed: $(oneline "$newer")" nextcloud_ioc
 	done <<EOF
 $(find_in_roots '*/richdocumentscode/appinfo/info.xml' 7)
 EOF
@@ -653,7 +658,7 @@ EOF
 	# Exploit attempts in web server logs
 	logs=$(ls /var/log/apache2/*access*log /var/log/nginx/*access*log /var/log/httpd/*access*log 2>/dev/null)
 	[ "$OPT_DEEP" = 1 ] && logs="$logs $(ls /var/log/apache2/*access*log.* /var/log/nginx/*access*log.* 2>/dev/null)"
-	if [ -n "$(echo $logs)" ]; then
+	if [ -n "$(oneline "$logs")" ]; then
 		# shellcheck disable=SC2086
 		hits=$(zgrep -ihE 'richdocumentscode/proxy\.php[^ "]*(%2e%2e|\$\(|\$\{IFS|%24%28|%24%7b)' $logs 2>/dev/null | wc -l | tr -d ' ')
 		[ "${hits:-0}" -gt 0 ] && add CRIT IOC "Nextcloud CODE exploit attempts" "$hits proxy.php injection request(s) in web server logs" nextcloud_ioc
@@ -673,8 +678,8 @@ check_wordpress_host() {
 		eval_updraft "$site" "$ver"
 		recent=$(newer_than "$site/wp-content/plugins" "$UPDRAFT_INCIDENT_START" | grep -v '/updraftplus$' | sed 's|.*/||' | head -n10)
 		mu=$(newer_than "$site/wp-content/mu-plugins" "$UPDRAFT_INCIDENT_START" | sed 's|.*/||' | head -n10)
-		[ -n "$recent" ] && add HIGH CHECK "WordPress plugins" "$site: plugins added/changed since $UPDRAFT_INCIDENT_START: $(echo $recent)" updraft
-		[ -n "$mu" ] && add HIGH CHECK "WordPress mu-plugins" "$site: must-use plugins added/changed since $UPDRAFT_INCIDENT_START: $(echo $mu)" updraft
+		[ -n "$recent" ] && add HIGH CHECK "WordPress plugins" "$site: plugins added/changed since $UPDRAFT_INCIDENT_START: $(oneline "$recent")" updraft
+		[ -n "$mu" ] && add HIGH CHECK "WordPress mu-plugins" "$site: must-use plugins added/changed since $UPDRAFT_INCIDENT_START: $(oneline "$mu")" updraft
 		if [ "$OPT_DEEP" = 1 ] && [ "$IS_ROOT" = 1 ] && have wp; then
 			# Run wp-cli as the site owner without loading plugins/themes (they may be backdoored)
 			owner=$(stat -c %U "$site/wp-config.php" 2>/dev/null || stat -c %U "$site" 2>/dev/null)
@@ -682,7 +687,7 @@ check_wordpress_host() {
 				timeout 30 runuser -u "${owner:-www-data}" -- wp --path="$site" --skip-plugins --skip-themes \
 					user list --role="$role" --fields=user_login,user_registered --format=csv 2>/dev/null
 			done | awk -F, -v d="$UPDRAFT_INCIDENT_START" '$1 != "user_login" && $2 >= d { print $1 }')
-			[ -n "$admins" ] && add CRIT IOC "WordPress users" "$site: admin/editor accounts created since $UPDRAFT_INCIDENT_START: $(echo $admins)" updraft
+			[ -n "$admins" ] && add CRIT IOC "WordPress users" "$site: admin/editor accounts created since $UPDRAFT_INCIDENT_START: $(oneline "$admins")" updraft
 		fi
 	done <<EOF
 $(find_in_roots '*/wp-includes/version.php' 6)
@@ -853,7 +858,7 @@ EOF
 check_ioc() {
 	local procs ip conns hits="" tmpx="" pid exe any=0
 	procs=$(printf '%s\n' "$PS_OUT" | grep -E "$IOC_PROC_RE" | awk '{ $2 = ""; print substr($0, 1, 100) }' | head -n5)
-	[ -n "$procs" ] && { any=1; add CRIT IOC "Miner / proxy processes" "$(echo $procs)" ioc; }
+	[ -n "$procs" ] && { any=1; add CRIT IOC "Miner / proxy processes" "$(oneline "$procs")" ioc; }
 	if have ss; then
 		conns=$(ss -tn 2>/dev/null)
 		for ip in $IOC_IPS; do
@@ -862,11 +867,12 @@ check_ioc() {
 		[ -n "$hits" ] && { any=1; add CRIT IOC "Connections to known attacker IPs" "active TCP connections to:$hits" ioc; }
 	fi
 	if [ "$IS_ROOT" = 1 ]; then
-		for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+		for pid in /proc/[0-9]*; do
+			pid=${pid#/proc/}
 			exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
 			case $exe in /tmp/* | /var/tmp/* | /dev/shm/* | memfd:*) tmpx="$tmpx $pid:$exe" ;; esac
 		done
-		[ -n "$tmpx" ] && { any=1; add HIGH IOC "Processes running from temp dirs" "$(echo $tmpx | cut -c1-200)" ioc; }
+		[ -n "$tmpx" ] && { any=1; add HIGH IOC "Processes running from temp dirs" "$(oneline "$tmpx" | cut -c1-200)" ioc; }
 	fi
 	[ "$any" = 0 ] && add CRIT OK "IOC sweep" "no known miner/proxy processes, attacker IPs or temp-dir binaries"
 	return 0
