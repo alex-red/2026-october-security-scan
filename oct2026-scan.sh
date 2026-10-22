@@ -545,8 +545,8 @@ check_nginx() {
 	if [ -n "$bin" ] && [ "$IS_ROOT" = 1 ]; then
 		conf=$(timeout 10 "$bin" -T 2>/dev/null | sed 's/#.*//')
 		if [ -n "$conf" ]; then
+			# shellcheck disable=SC2016 # literal nginx variable name
 			printf '%s\n' "$conf" | grep -qE '^[[:space:]]*alias[[:space:]]' &&
-				# shellcheck disable=SC2016 # literal nginx variable name
 				printf '%s\n' "$conf" | grep -qE '^[[:space:]]*rewrite[[:space:]]|\$request_filename' && risky="$risky alias+rewrite"
 			printf '%s\n' "$conf" | grep -qE '^[[:space:]]*aio[[:space:]]+(on|threads)' &&
 				printf '%s\n' "$conf" | grep -qE '^[[:space:]]*ssi[[:space:]]+on' && risky="$risky aio+ssi"

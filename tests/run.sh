@@ -49,7 +49,7 @@ vc 1.0a 1.0 1
 vc 1.0 1.0.0 -1
 
 # Use dpkg when available (CI runs the suite both ways via OCT_SCAN_VCMP=awk)
-have dpkg || OCT_SCAN_VCMP=awk
+have dpkg || OCT_SCAN_VCMP="awk"
 
 # --- helpers ---
 [ "$(upstream 1:8.3.6-0ubuntu0.24.04.13)" = 8.3.6 ] && ok || bad upstream-epoch
