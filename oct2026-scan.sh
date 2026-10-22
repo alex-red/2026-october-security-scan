@@ -1076,13 +1076,13 @@ log_counts() {
 
 # eval_log_counts LABEL LOG_COUNTS-OUTPUT
 eval_log_counts() {
-	local lbl=$1 line k v mem=0 crash=0 up200=0 up=0 inj=0 ips=0 failed=0 home=0 reached=0 follow=0
+	local lbl=$1 line k v mem=0 crash=0 up200=0 up=0 inj=0 ips=0 home=0 reached=0 follow=0
 	local codes="" crash_s="" up_s="" reach_s="" follow_s="" sum
 	while IFS= read -r line; do
 		k=${line%%=*} v=${line#*=}
 		case $k in
 		mem) mem=$v ;; crash) crash=$v ;; up200) up200=$v ;; up) up=$v ;; inj) inj=$v ;; inj_ips) ips=$v ;;
-		inj_failed) failed=$v ;; inj_home) home=$v ;; inj_reached) reached=$v ;; follow) follow=$v ;;
+		inj_home) home=$v ;; inj_reached) reached=$v ;; follow) follow=$v ;;
 		codes) codes=$v ;; crash_s) crash_s=$v ;; up_s) up_s=$v ;; reach_s) reach_s=$v ;; follow_s) follow_s=$v ;;
 		esac
 	done <<EOF
