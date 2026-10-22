@@ -13,7 +13,7 @@
 set -u
 set -o pipefail
 
-SCAN_VERSION="1.0.1"
+SCAN_VERSION="1.1.0"
 DATA_DATE="2026-10-22"
 
 # ---------------------------------------------------------------------------
@@ -42,6 +42,8 @@ ghostscript ubuntu noble    ghostscript  10.02.1~dfsg1-0ubuntu7.10        USN-89
 ghostscript ubuntu jammy    ghostscript  9.55.0~dfsg1-0ubuntu5.15         USN-8949-1
 ghostscript ubuntu focal    ghostscript  9.50~dfsg-5ubuntu4.15+esm3       USN-8949-1(Ubuntu-Pro)
 ghostscript debian trixie   ghostscript  10.05.1~dfsg-1+deb13u3           DSA-6550-1
+curl        ubuntu stonking curl         8.20.0-2ubuntu11.1               ubuntu.com/security/CVE-2026-92392
+curl        ubuntu resolute curl         8.18.0-1ubuntu2.8                ubuntu.com/security/CVE-2026-92392
 '
 
 # Upstream thresholds
@@ -61,6 +63,29 @@ PHP2SHELL_DISCLOSED="2026-10-21"
 IOC_IPS="217.60.194.116 91.92.40.202 176.65.139.228 45.194.92.222 139.28.18.122 89.38.98.50"
 IOC_PROC_RE='xmrig|--donate-level|--rig-id|myawesomeproxy|mylovelyminer|proxystream|(^|[/ ])x12345( |$)'
 
+# --- Signs of exploitation ---------------------------------------------------
+# Default lookback for "changed since" checks (--since overrides). Earliest
+# activity in this cluster: Nextcloud CODE 2026-09-10 (checked separately),
+# Plex2Shell PoC 10-16, UpdraftCentral 10-17, PHP2Shell attempts 10-17/10-21.
+IOC_SINCE_DEFAULT="2026-10-01"
+# Webshell code patterns (POSIX ERE; also used by busybox grep inside containers)
+WEBSHELL_RE='eval[[:space:]]*\([[:space:]]*(base64_decode|gzinflate|gzuncompress|str_rot13|rawurldecode|\$_(POST|GET|REQUEST|COOKIE|SERVER))|(assert|system|exec|shell_exec|passthru|popen|proc_open|pcntl_exec)[[:space:]]*\([[:space:]]*\$_(POST|GET|REQUEST|COOKIE)|\$_(POST|GET|REQUEST|COOKIE)[[:space:]]*\[[^]]*\][[:space:]]*\(|create_function[[:space:]]*\([^)]*\$_(POST|GET|REQUEST|COOKIE)|FilesMan|b374k|r57shell|c99shell|IndoXploit|ALFA_DATA|WSOsetcookie'
+# Download-and-execute / reverse-shell patterns in cron jobs and unit files
+DL_EXEC_RE='(curl|wget)[^|;]*\|[[:space:]]*(ba|da)?sh|base64[[:space:]]+(-d|--decode)|/dev/tcp/|(nc|ncat|netcat)[[:space:]].*-e[[:space:]]|python[0-9.]*[[:space:]]+-c|(ba)?sh[[:space:]]+-i'
+# Web workers, and children that should never run under them
+WEB_PARENT_RE='php-fpm|php-cgi|apache2|httpd|lsphp|frankenphp|nginx: worker'
+SUSP_CHILD_RE='^(sh|bash|dash|ash|zsh|ksh|perl|python[0-9.]*|ruby|nc|ncat|netcat|socat|curl|wget|busybox|base64|id|whoami|uname|telnet|xmrig)$'
+# Mail delivery legitimately runs "sh -c sendmail" under PHP
+WEB_CHILD_OK_RE='sendmail|msmtp|ssmtp|exim|postdrop'
+# Processes holding network connections that should only be interactive tools
+NET_SHELL_RE='^(sh|bash|dash|ash|zsh|ksh|nc|ncat|netcat|socat|telnet)$'
+# Long-running high-CPU processes that are normal on servers
+CPU_OK_RE='^(kvm|qemu-system|ffmpeg|Plex Transcoder|HandBrakeCLI|mysqld|mariadbd|postgres|java|node|dockerd|containerd|kworker|ksoftirqd|z_|zfs|txg_sync|rsync|borg|restic|gzip|xz|zstd|pigz|clamscan|apt|dpkg|unattended-upgr|php-fpm|apache2|nginx)'
+# auto_prepend_file values used by legitimate security plugins
+PREPEND_OK_RE='wordfence-waf\.php|ninjafirewall|malcare|sucuri|bbq-firewall'
+# Remediation keys that describe evidence of exploitation (vs. a missing patch)
+COMPROMISE_REMS=" ioc webshell wp_ioc persistence attempts crash drift cpu plex_ioc nextcloud_ioc "
+
 # ---------------------------------------------------------------------------
 # Options
 # ---------------------------------------------------------------------------
@@ -69,6 +94,8 @@ OPT_DOCKER=1
 OPT_DEEP=0
 OPT_QUIET=0
 OPT_COLOR=auto
+SINCE=$IOC_SINCE_DEFAULT
+DAYS=30
 
 usage() {
 	cat <<EOF
@@ -79,7 +106,9 @@ Usage: sudo bash oct2026-scan.sh [options]
 
   --json        machine-readable output
   --no-docker   do not inspect running containers (docker exec / podman exec)
-  --deep        wider filesystem search, rotated logs, and WordPress user audit via wp-cli
+  --deep        wider filesystem search, rotated logs, webshell scan of ALL PHP files (not only
+                recently changed ones), and new WordPress admin accounts (reads the site database)
+  --since DATE  lookback for signs of exploitation, YYYY-MM-DD (default $IOC_SINCE_DEFAULT)
   -q, --quiet   hide OK / N/A rows
   --no-color    disable colors (NO_COLOR is honoured too)
   -h, --help    this help
@@ -97,6 +126,12 @@ parse_args() {
 		--json) OPT_JSON=1 ;;
 		--no-docker) OPT_DOCKER=0 ;;
 		--deep) OPT_DEEP=1 ;;
+		--since)
+			case ${2:-} in
+			[0-9][0-9][0-9][0-9]-[0-1][0-9]-[0-3][0-9]) SINCE=$2; shift ;;
+			*) echo "--since needs a date like 2026-10-01" >&2; exit 3 ;;
+			esac
+			;;
 		-q | --quiet) OPT_QUIET=1 ;;
 		--no-color) OPT_COLOR=never ;;
 		-h | --help) usage; exit 0 ;;
@@ -197,16 +232,23 @@ F_STAT=()
 F_COMP=()
 F_DETAIL=()
 F_REM=()
+F_KIND=()
+# Section new findings go to: vuln (missing patches) or ioc (signs of exploitation)
+CUR_KIND=vuln
 
 # add SEVERITY STATUS COMPONENT DETAIL [REMEDIATION-KEY]
 # SEVERITY: CRIT HIGH MED LOW INFO
 # STATUS:   IOC VULNERABLE CHECK OK N/A SKIPPED
 add() {
+	local kind=$CUR_KIND
+	[ "$2" = IOC ] && kind=ioc
+	case $COMPROMISE_REMS in *" ${5:-none} "*) kind=ioc ;; esac
 	F_SEV[${#F_SEV[@]}]=$1
 	F_STAT[${#F_STAT[@]}]=$2
 	F_COMP[${#F_COMP[@]}]=$3
 	F_DETAIL[${#F_DETAIL[@]}]=$4
 	F_REM[${#F_REM[@]}]=${5:-}
+	F_KIND[${#F_KIND[@]}]=$kind
 }
 
 # ---------------------------------------------------------------------------
@@ -225,6 +267,21 @@ LISTEN=""
 PS_OUT=""
 CTR=""
 PLEX_SEEN=0
+SWARM=0
+CAPROVER=0
+# Host paths bind-mounted into inspected containers' web roots (checked there, not twice)
+COVERED=""
+# WordPress roots (host paths) that have UpdraftPlus installed
+UPDRAFT_SITES=""
+
+# is_covered PATH: PATH lies inside a directory already inspected through a container
+is_covered() {
+	local c
+	for c in $COVERED; do
+		case $1 in "$c" | "$c"/*) return 0 ;; esac
+	done
+	return 1
+}
 
 detect_env() {
 	[ "$(id -u)" = 0 ] && IS_ROOT=1
@@ -500,7 +557,7 @@ check_php() {
 			extra="session.upload_progress disabled (partial mitigation only)"
 		[ -n "$extra" ] && F_DETAIL[${#F_DETAIL[@]} - 1]="${F_DETAIL[$((${#F_DETAIL[@]} - 1))]}; $extra"
 	done <<EOF
-$(src_versions '^php[0-9]+(\.[0-9]+)?$')
+$(src_versions '^php[0-9]+([.][0-9]+)?$')
 EOF
 	# PHP not installed from Debian/Ubuntu packages (source builds, /opt stacks)
 	for b in $(type -ap php 2>/dev/null) /usr/local/bin/php /usr/local/sbin/php-fpm /opt/*/bin/php /opt/*/sbin/php-fpm; do
@@ -590,7 +647,6 @@ check_plex_host() {
 			add CRIT N/A "Plex Media Server" "not found"
 		fi
 	fi
-	check_plex_children
 }
 
 # Children of Plex Media Server whose name doesn't start with "Plex" (transcoder, scanner,
@@ -644,8 +700,9 @@ check_nextcloud_host() {
 	local found=0
 	while IFS= read -r f; do
 		[ -n "$f" ] || continue
-		found=1
 		dir=${f%/appinfo/info.xml}
+		is_covered "$dir" && continue
+		found=1
 		ver=$(sed -n 's:.*<version>\([^<]*\)</version>.*:\1:p' "$f" | head -n1)
 		eval_nextcloud_code "host $dir" "$ver"
 		shx=$(find "$dir" -name 'shx*.php' 2>/dev/null | head -n5)
@@ -668,32 +725,30 @@ EOF
 }
 
 check_wordpress_host() {
-	local f site ver up recent mu sites=0 owner admins
+	local f site ver up sites=0 owner admins
 	while IFS= read -r f; do
 		[ -n "$f" ] || continue
 		site=${f%/wp-includes/version.php}
+		is_covered "$site" && continue
 		sites=$((sites + 1))
 		up="$site/wp-content/plugins/updraftplus/updraftplus.php"
 		[ -f "$up" ] || continue
+		UPDRAFT_SITES="$UPDRAFT_SITES $site"
 		ver=$(sed -n 's/^[ *]*Version:[ ]*\([0-9][0-9.]*\).*/\1/p' "$up" | head -n1)
 		eval_updraft "$site" "$ver"
-		recent=$(newer_than "$site/wp-content/plugins" "$UPDRAFT_INCIDENT_START" | grep -v '/updraftplus$' | sed 's|.*/||' | head -n10)
-		mu=$(newer_than "$site/wp-content/mu-plugins" "$UPDRAFT_INCIDENT_START" | sed 's|.*/||' | head -n10)
-		[ -n "$recent" ] && add HIGH CHECK "WordPress plugins" "$site: plugins added/changed since $UPDRAFT_INCIDENT_START: $(oneline "$recent")" updraft
-		[ -n "$mu" ] && add HIGH CHECK "WordPress mu-plugins" "$site: must-use plugins added/changed since $UPDRAFT_INCIDENT_START: $(oneline "$mu")" updraft
 		if [ "$OPT_DEEP" = 1 ] && [ "$IS_ROOT" = 1 ] && have wp; then
 			# Run wp-cli as the site owner without loading plugins/themes (they may be backdoored)
 			owner=$(stat -c %U "$site/wp-config.php" 2>/dev/null || stat -c %U "$site" 2>/dev/null)
 			admins=$(for role in administrator editor; do
 				timeout 30 runuser -u "${owner:-www-data}" -- wp --path="$site" --skip-plugins --skip-themes \
 					user list --role="$role" --fields=user_login,user_registered --format=csv 2>/dev/null
-			done | awk -F, -v d="$UPDRAFT_INCIDENT_START" '$1 != "user_login" && $2 >= d { print $1 }')
-			[ -n "$admins" ] && add CRIT IOC "WordPress users" "$site: admin/editor accounts created since $UPDRAFT_INCIDENT_START: $(oneline "$admins")" updraft
+			done | awk -F, -v d="$SINCE" '$1 != "user_login" && $2 >= d { print $1 " (" $2 ")" }')
+			[ -n "$admins" ] && add CRIT IOC "WordPress new admins" "$site: admin/editor accounts created since $SINCE: $(oneline "$admins")" wp_ioc
 		fi
 	done <<EOF
 $(find_in_roots '*/wp-includes/version.php' 6)
 EOF
-	[ "$sites" = 0 ] && add HIGH N/A "WordPress / UpdraftPlus" "no WordPress sites found on host"
+	[ "$sites" = 0 ] && [ -z "$COVERED" ] && add HIGH N/A "WordPress / UpdraftPlus" "no WordPress sites found on host"
 	return 0
 }
 
@@ -780,6 +835,52 @@ done
 EOF
 )
 
+# Read-only POSIX sh probe for signs of exploitation; runs on the host and inside containers.
+# Args: DAYS DEEP WEBSHELL_RE DL_EXEC_RE SYS ROOTS...   (SYS=1 also checks cron/preload/tmp)
+ioc_probe() {
+	cat <<'EOF'
+days=$1 deep=$2 sig=$3 dl=$4 sys=$5
+shift 5
+age="-mtime -$days"
+[ "$deep" = 1 ] && age=""
+for d in "$@"; do
+  [ -d "$d" ] || continue
+  # PHP inside upload directories (WordPress, Drupal, Laravel); skip "silence is golden" stubs
+  find "$d" -maxdepth 10 -type f \( -path '*/wp-content/uploads/*' -o -path '*/sites/default/files/*' -o -path '*/storage/app/public/*' \) \
+    \( -name '*.php' -o -name '*.php[0-9]' -o -name '*.phtml' -o -name '*.phar' \) 2>/dev/null | head -n 50 | while read -r f; do
+    case $f in */index.php) grep -qE 'eval|\$_|base64|system|exec' "$f" 2>/dev/null || continue ;; esac
+    echo "upphp=$f"
+  done
+  # auto_prepend_file / auto_append_file persistence
+  find "$d" -maxdepth 8 -type f \( -name .user.ini -o -name .htaccess -o -name php.ini \) 2>/dev/null | head -n 2000 | while read -r f; do
+    v=$(grep -iE '^[[:space:]]*(php_value[[:space:]]+)?auto_(prepend|append)_file' "$f" 2>/dev/null | grep -viE '(=|[[:space:]])[[:space:]]*"?(none)?"?[[:space:]]*$' | head -n1)
+    [ -n "$v" ] && echo "prepend=$f|$v"
+  done
+  # Webshell code in PHP files (recently changed ones; all with --deep)
+  # shellcheck disable=SC2086
+  find "$d" -maxdepth 12 -type f \( -name '*.php' -o -name '*.phtml' -o -name '*.php[0-9]' -o -name '*.inc' \) $age \
+    -exec grep -lE "$sig" {} + 2>/dev/null | head -n 10 | sed 's/^/sig=/'
+  # shellcheck disable=SC2086
+  echo "recent=$d|$(find "$d" -maxdepth 12 -type f -name '*.php' -mtime -"$days" 2>/dev/null | wc -l | tr -d ' ')"
+  # WordPress: mu-plugins, drop-ins and plugin folders changed in the window
+  find "$d" -maxdepth 8 -type f -path '*/wp-content/mu-plugins/*' -mtime -"$days" 2>/dev/null | head -n 10 | sed 's/^/mu=/'
+  find "$d" -maxdepth 8 -type f \( -path '*/wp-content/db.php' -o -path '*/wp-content/object-cache.php' -o -path '*/wp-content/advanced-cache.php' \) \
+    -mtime -"$days" 2>/dev/null | sed 's/^/dropin=/'
+  find "$d" -maxdepth 8 -mindepth 1 -type d -path '*/wp-content/plugins/*' ! -path '*/wp-content/plugins/*/*' -mtime -"$days" 2>/dev/null | head -n 20 | sed 's/^/plug=/'
+done
+if [ "$sys" = 1 ]; then
+  [ -s /etc/ld.so.preload ] && echo "preload=$(head -c 200 /etc/ld.so.preload | tr '\n' ' ')"
+  for f in /etc/crontab /etc/cron.d/* /etc/crontabs/* /var/spool/cron/crontabs/* /var/spool/cron/*; do
+    [ -f "$f" ] && grep -qiE "$dl" "$f" 2>/dev/null && echo "cron=$f"
+  done
+  find /tmp /var/tmp /dev/shm -maxdepth 3 -type f 2>/dev/null | head -n 500 | while read -r f; do
+    [ "$(head -c 4 "$f" 2>/dev/null | tr -d '\177')" = ELF ] && echo "tmpelf=$f"
+  done
+fi
+exit 0
+EOF
+}
+
 check_containers() {
 	if [ "$OPT_DOCKER" = 0 ]; then
 		add INFO SKIPPED "Containers" "skipped (--no-docker)"
@@ -795,26 +896,49 @@ check_containers() {
 		fi
 		return
 	fi
-	local name image out n=0 noshell=""
-	while IFS="$(printf '\t')" read -r name image; do
+	local ids name image svc mounts m src dst out lbl n=0 noshell=""
+	ids=$("$CTR" ps -q 2>/dev/null)
+	[ -n "$ids" ] || { add INFO OK "Containers" "no running containers"; return; }
+	# shellcheck disable=SC2086
+	while IFS="$(printf '\t')" read -r name image svc mounts; do
 		[ -n "$name" ] || continue
 		n=$((n + 1))
-		if ! out=$(timeout 30 "$CTR" exec "$name" sh -c "$PROBE" 2>/dev/null); then
+		name=${name#/}
+		image=${image%%@sha256:*}
+		[ "$svc" = "<no value>" ] && svc=""
+		[ -n "$svc" ] && SWARM=1
+		case "$name $svc" in captain-* | *srv-captain--*) CAPROVER=1 ;; esac
+		lbl="container $name"
+		[ -n "$svc" ] && lbl="service $svc"
+		# Host directories mounted into the container's web roots are checked through the container
+		for m in $(printf '%s' "$mounts" | tr ';' ' '); do
+			src=${m%%>*} dst=${m#*>}
+			case $dst in /var/www | /var/www/* | /app | /app/* | /config/www | /config/www/* | /srv | /srv/*) COVERED="$COVERED $src" ;; esac
+		done
+		if ! out=$(timeout 60 "$CTR" exec "$name" sh -c "$PROBE
+$(ioc_probe)" probe "$DAYS" "$OPT_DEEP" "$WEBSHELL_RE" "$DL_EXEC_RE" 1 /var/www /app /config/www /srv /usr/share/nginx/html 2>/dev/null); then
 			[ -n "$out" ] || { noshell="$noshell $name"; continue; }
 		fi
-		eval_container "$name" "$image" "$out"
+		CTR_OUT="${CTR_OUT}${name}	${lbl}	${image}
+"
+		eval_container "$lbl" "$image" "$out"
+		CTR_IOC_OUT="${CTR_IOC_OUT}@@${lbl}
+${out}
+"
 	done <<EOF
-$("$CTR" ps --format '{{.Names}}\t{{.Image}}' 2>/dev/null)
+$("$CTR" inspect -f '{{.Name}}	{{.Config.Image}}	{{index .Config.Labels "com.docker.swarm.service.name"}}	{{range .Mounts}}{{.Source}}>{{.Destination}};{{end}}' $ids 2>/dev/null)
 EOF
 	[ -n "$noshell" ] && add MED CHECK "Containers without shell" "could not inspect:$noshell — check their image versions manually" containers
 	add INFO OK "Containers" "$n running container(s) inspected via $CTR exec"
 }
+# Per-container data kept for the exploitation phase
+CTR_OUT=""
+CTR_IOC_OUT=""
 
-# eval_container NAME IMAGE PROBE-OUTPUT
+# eval_container LABEL IMAGE PROBE-OUTPUT  (version checks; evidence is evaluated later)
 eval_container() {
-	local name=$1 image=$2 out=$3 line k v os="" cn="" php="" nginx="" plexflag=0 codecs="" sos=""
-	local pkgs="" src ver lbl
-	lbl="container $name"
+	local lbl=$1 image=$2 out=$3 line k v os="" cn="" php="" nginx="" plexflag=0 codecs="" sos=""
+	local pkgs="" src ver
 	while IFS= read -r line; do
 		k=${line%%=*} v=${line#*=}
 		case $k in
@@ -854,8 +978,266 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Generic indicators of compromise and exposure
+# Signs of exploitation
 # ---------------------------------------------------------------------------
+
+# list_short "a b c d" → "a b c (+1 more)" — keeps rows to one line
+list_short() {
+	local n=0 out="" x
+	for x in $1; do
+		n=$((n + 1))
+		[ "$n" -le 3 ] && out="$out $x"
+	done
+	[ "$n" -gt 3 ] && out="$out (+$((n - 3)) more)"
+	printf '%s' "${out# }"
+}
+
+# eval_ioc_output LABEL PROBE-OUTPUT UPDRAFT-SITES — findings from IOC_PROBE output
+eval_ioc_output() {
+	local lbl=$1 out=$2 usites=" $3 " line k v f
+	local up="" sig="" pre="" mu="" drop="" plug="" plugu="" cron="" preload="" elf="" recent=0 site
+	while IFS= read -r line; do
+		k=${line%%=*} v=${line#*=}
+		case $k in
+		upphp) up="$up $v" ;;
+		sig) sig="$sig $v" ;;
+		prepend)
+			f=${v%%|*}
+			printf '%s' "${v#*|}" | grep -qiE "$PREPEND_OK_RE" || pre="$pre $f"
+			;;
+		mu) mu="$mu $v" ;;
+		dropin) drop="$drop $v" ;;
+		plug)
+			site=${v%/wp-content/plugins/*}
+			case $v in */updraftplus) continue ;; esac
+			case $usites in *" $site "*) plugu="$plugu ${v##*/}" ;; *) plug="$plug ${v##*/}" ;; esac
+			;;
+		cron) cron="$cron $v" ;;
+		preload) preload=$v ;;
+		tmpelf) elf="$elf $v" ;;
+		recent) recent=$((recent + ${v#*|})) ;;
+		esac
+	done <<EOF
+$out
+EOF
+	[ -n "$up" ] && add CRIT IOC "PHP in uploads folder" "$lbl: $(list_short "$up")" webshell
+	[ -n "$sig" ] && add CRIT IOC "Webshell code" "$lbl: $(list_short "$sig")" webshell
+	[ -n "$pre" ] && add HIGH CHECK "auto_prepend_file set" "$lbl: $(list_short "$pre") — PHP runs this file before every request" webshell
+	[ -n "$preload" ] && add CRIT IOC "/etc/ld.so.preload" "$lbl: preloads $preload" persistence
+	[ -n "$cron" ] && add CRIT IOC "Download-and-run cron job" "$lbl: $(list_short "$cron")" persistence
+	[ -n "$elf" ] && add HIGH CHECK "Binaries in temp dirs" "$lbl: $(list_short "$elf")" persistence
+	[ -n "$mu" ] && add HIGH CHECK "WordPress mu-plugins changed" "$lbl: since $SINCE: $(list_short "$mu")" wp_ioc
+	[ -n "$drop" ] && add MED CHECK "WordPress drop-ins changed" "$lbl: since $SINCE: $(list_short "$drop")" wp_ioc
+	[ -n "$plugu" ] && add HIGH CHECK "Plugins changed (UpdraftCentral)" "$lbl: since $SINCE on a site with UpdraftPlus: $(list_short "$plugu")" wp_ioc
+	[ -n "$plug" ] && add INFO CHECK "Plugins added/updated" "$lbl: since $SINCE: $(list_short "$plug") — expected if you updated them" wp_ioc
+	[ "$recent" -gt 0 ] && [ -z "$up$sig" ] && add INFO OK "PHP files changed" "$lbl: $recent PHP file(s) changed since $SINCE, none match webshell patterns"
+	return 0
+}
+
+# log_counts < LOG-LINES → "mem crash up200 up inject<TAB>crash-sample<TAB>uploads-sample"
+log_counts() {
+	awk '
+	/Allowed memory size of [0-9]+ bytes exhausted/ { m++ }
+	/exit signal Segmentation fault|exited on signal (6|11)|SIGSEGV|segfault at/ { c++; if (cs == "") cs = substr($0, 1, 120) }
+	/\/wp-content\/uploads\/[^ "?]*\.(php[0-9]?|phtml|phar)/ {
+		if ($0 ~ /\/wp-content\/uploads\/[^ "?]*\.(php[0-9]?|phtml|phar)[^"]*" 200 /) { u2++; if (us == "") us = substr($0, 1, 120) } else u++
+	}
+	{ l = tolower($0) }
+	l ~ /(\$\(|%24%28|\$\{ifs|%24%7bifs|\/bin\/(ba)?sh|(wget|curl)(%20|\+)http|base64_decode|php:\/\/input|allow_url_include|auto_prepend_file)/ { i++ }
+	END { printf "%d %d %d %d %d\t%s\t%s\n", m, c, u2, u, i, cs, us }'
+}
+
+# eval_log_counts LABEL "COUNTS<TAB>CRASH-SAMPLE<TAB>UPLOAD-SAMPLE"
+eval_log_counts() {
+	local lbl=$1 nums cs us m c u2 u i
+	nums=$(printf '%s' "$2" | cut -f1)
+	cs=$(printf '%s' "$2" | cut -f2)
+	us=$(printf '%s' "$2" | cut -f3)
+	read -r m c u2 u i <<EOF
+$nums
+EOF
+	[ "${u2:-0}" -gt 0 ] && add CRIT IOC "PHP executed from uploads" "$lbl: $u2 successful request(s), e.g. $us" webshell
+	[ "${c:-0}" -gt 0 ] && add HIGH CHECK "Web worker crashes" "$lbl: $c segfault/abort(s) since $SINCE, e.g. $cs" crash
+	[ "${m:-0}" -gt 0 ] && add MED CHECK "PHP memory-limit fatals" "$lbl: $m since $SINCE (the PHP2Shell trigger condition)" attempts
+	[ "${u:-0}" -gt 0 ] && add INFO CHECK "Probes for PHP in uploads" "$lbl: $u failed request(s) since $SINCE" attempts
+	[ "${i:-0}" -gt 0 ] && add INFO CHECK "Injection probes" "$lbl: $i request(s) with shell/PHP injection payloads since $SINCE" attempts
+	return 0
+}
+
+# eval_drift LABEL "docker diff" output — files changed in the container's writable layer
+eval_drift() {
+	local lbl=$1 res ioc chk
+	res=$(printf '%s\n' "$2" | awk '
+		{ t = $1; p = $2 }
+		p ~ /^\/(proc|sys|dev|run|var\/run|var\/lock|var\/log|var\/cache|tmp|var\/tmp)(\/|$)/ { next }
+		t != "D" && p ~ /^\/etc\/ld\.so\.preload$|^\/etc\/cron[^\/]*\/.|^\/etc\/crontabs\/.|^\/var\/spool\/cron\/.|^\/root\/\.ssh\/./ { print "ioc " p; next }
+		t != "D" && p ~ /^\/etc\/(passwd|shadow|sudoers)/ { print "chk " p; next }
+		t == "A" && p ~ /^\/(usr|bin|sbin|lib|lib64|opt|etc\/init\.d|etc\/systemd|etc\/profile\.d)\/./ { print "chk " p }')
+	ioc=$(printf '%s\n' "$res" | sed -n 's/^ioc //p')
+	chk=$(printf '%s\n' "$res" | sed -n 's/^chk //p')
+	[ -n "$ioc" ] && add CRIT IOC "Container persistence" "$lbl: $(list_short "$(oneline "$ioc")")" drift
+	[ -n "$chk" ] && add MED CHECK "Container files changed" "$lbl: outside volumes: $(list_short "$(oneline "$chk")")" drift
+	return 0
+}
+
+eval_ctr_block() { # LABEL PROBE-OUTPUT
+	eval_ioc_output "$1" "$2" "$(printf '%s\n' "$2" | sed -n 's/^updraft=\([^|]*\)|.*/\1/p' | tr '\n' ' ')"
+}
+
+# Evidence collected per container: probe results, logs, filesystem drift
+check_containers_ioc() {
+	[ -n "$CTR" ] || return 0
+	local line lbl="" out="" name image logs
+	# Probe output blocks are separated by "@@LABEL" lines
+	while IFS= read -r line; do
+		case $line in
+		@@*)
+			[ -n "$lbl" ] && eval_ctr_block "$lbl" "$out"
+			lbl=${line#@@} out=""
+			;;
+		*) out="$out$line
+" ;;
+		esac
+	done <<EOF
+$CTR_IOC_OUT
+EOF
+	[ -n "$lbl" ] && eval_ctr_block "$lbl" "$out"
+	while IFS="$(printf '\t')" read -r name lbl image; do
+		[ -n "$name" ] || continue
+		logs=$(timeout 60 "$CTR" logs --since "$SINCE" "$name" 2>&1 | log_counts)
+		eval_log_counts "$lbl" "$logs"
+		eval_drift "$lbl" "$(timeout 30 "$CTR" diff "$name" 2>/dev/null)"
+	done <<EOF
+$CTR_OUT
+EOF
+	return 0
+}
+
+# Host web roots (minus anything already covered through a container)
+check_host_webroots_ioc() {
+	local roots="" r out list="/var/www /srv /opt /home /usr/share/nginx /usr/share/webapps /var/lib/nextcloud /snap/nextcloud/current"
+	# --deep adds more web-content locations, but never /var/lib/docker (containers are probed directly) or media mounts
+	[ "$OPT_DEEP" = 1 ] && list="$list /root /usr/local /www /var/lib/www"
+	for r in $list; do
+		[ -d "$r" ] && ! is_covered "$r" && roots="$roots $r"
+	done
+	[ -n "$roots" ] || return 0
+	# shellcheck disable=SC2086
+	out=$(sh -c "$(ioc_probe)" probe "$DAYS" "$OPT_DEEP" "$WEBSHELL_RE" "$DL_EXEC_RE" 0 $roots 2>/dev/null |
+		while IFS= read -r line; do
+			v=${line#*=}
+			is_covered "${v%%|*}" || printf '%s\n' "$line"
+		done)
+	eval_ioc_output "host" "$out" "$UPDRAFT_SITES"
+}
+
+# Web server / PHP logs on the host, plus kernel-logged crashes of web workers
+check_host_logs() {
+	local files counts kcrash=0
+	files=$(ls /var/log/apache2/*.log /var/log/nginx/*.log /var/log/httpd/*log /var/log/php*-fpm.log /var/log/php*/*.log 2>/dev/null)
+	[ "$OPT_DEEP" = 1 ] && files="$files $(ls /var/log/apache2/*.log.* /var/log/nginx/*.log.* /var/log/httpd/*log.* 2>/dev/null)"
+	if [ -n "$(oneline "$files")" ]; then
+		# shellcheck disable=SC2086
+		counts=$(zcat -f $files 2>/dev/null | log_counts)
+		eval_log_counts "host logs" "$counts"
+	fi
+	if have journalctl; then
+		kcrash=$(journalctl -k --since "$SINCE" --no-pager 2>/dev/null | grep -E 'segfault at' | grep -cE 'php|apache2|httpd|nginx|lsphp|Plex')
+		[ "${kcrash:-0}" -gt 0 ] && add HIGH CHECK "Web worker crashes" "kernel log: $kcrash segfault(s) of PHP/web/Plex processes since $SINCE" crash
+	fi
+	return 0
+}
+
+# Shells or download tools running as children of web workers (all containers included)
+check_web_children() {
+	local hits
+	hits=$(printf '%s\n' "$PS_OUT" | awk -v wre="$WEB_PARENT_RE" -v cre="$SUSP_CHILD_RE" -v okre="$WEB_CHILD_OK_RE" '
+		{ cmd = ""; for (i = 4; i <= NF; i++) cmd = cmd (i > 4 ? " " : "") $i; P[$1] = $2; C[$1] = cmd; U[$1] = $3 }
+		END {
+			for (p in P) {
+				pp = P[p]
+				if (!(pp in C) || C[pp] !~ wre) continue
+				split(C[p], a, " "); b = a[1]; sub(/.*\//, "", b); sub(/:$/, "", b)
+				if (b ~ cre && C[p] !~ okre) print p ":" U[p] ":" substr(C[p], 1, 60)
+			}
+		}')
+	[ -n "$hits" ] && add CRIT IOC "Shell under web server" "$(oneline "$hits" | cut -c1-200)" ioc
+	check_plex_children
+	return 0
+}
+
+# Shells / netcat holding network connections (reverse shells); needs root for process names
+check_net_shells() {
+	have ss || return 0
+	[ "$IS_ROOT" = 1 ] || return 0
+	local hits
+	hits=$(ss -tnp 2>/dev/null | awk -v re="$NET_SHELL_RE" '
+		NR > 1 && $1 == "ESTAB" {
+			peer = $5; if (peer ~ /^(127\.|\[::1\]|::1)/) next
+			s = $0
+			while (match(s, /\("[^"]+"/)) {
+				name = substr(s, RSTART + 2, RLENGTH - 3); s = substr(s, RSTART + RLENGTH)
+				if (name ~ re) { print name "→" peer; break }
+			}
+		}' | sort -u)
+	[ -n "$hits" ] && add CRIT IOC "Reverse shell" "shell/netcat with network connection: $(oneline "$hits")" ioc
+	return 0
+}
+
+# Long-running CPU hogs not on the allow-list (miners)
+check_cpu() {
+	local hits
+	hits=$(ps -eo pid=,user=,pcpu=,etimes=,comm= 2>/dev/null | awk -v ok="$CPU_OK_RE" '
+		{ comm = $5; for (i = 6; i <= NF; i++) comm = comm " " $i }
+		$3 >= 80 && $4 >= 600 && comm !~ ok { printf "%s(pid %s, %s, %d%%)\n", comm, $1, $2, $3 }')
+	[ -n "$hits" ] && add MED CHECK "Sustained high CPU" "$(oneline "$hits" | cut -c1-200)" cpu
+	return 0
+}
+
+# Host persistence: preload, extra root accounts, cron/systemd/ssh changes
+check_persistence() {
+	local f uid0 webusers cronhits="" units="" unitbad="" keys="" sudo="" elf="" suid="" any=0
+	if [ -s /etc/ld.so.preload ]; then
+		any=1
+		add CRIT IOC "/etc/ld.so.preload" "host preloads: $(head -c 200 /etc/ld.so.preload | tr '\n' ' ')" persistence
+	fi
+	uid0=$(awk -F: '$3 == 0 && $1 != "root" { print $1 }' /etc/passwd 2>/dev/null)
+	[ -n "$uid0" ] && { any=1; add CRIT IOC "Extra root accounts" "UID 0 accounts besides root: $(oneline "$uid0")" persistence; }
+	webusers=$(awk -F: '($1 == "www-data" || $1 == "apache" || $1 == "nginx" || $1 == "http") && $7 !~ /(nologin|false)$/ { print $1 ":" $7 }' /etc/passwd 2>/dev/null)
+	[ -n "$webusers" ] && { any=1; add HIGH CHECK "Web user has a login shell" "$(oneline "$webusers")" persistence; }
+	for f in /etc/crontab /etc/cron.d/* /etc/cron.hourly/* /etc/cron.daily/* /var/spool/cron/crontabs/* /var/spool/cron/*; do
+		[ -f "$f" ] && grep -qiE "$DL_EXEC_RE" "$f" 2>/dev/null && cronhits="$cronhits $f"
+	done
+	for f in /var/spool/cron/crontabs/www-data /var/spool/cron/crontabs/apache /var/spool/cron/crontabs/nginx /var/spool/cron/www-data; do
+		[ -f "$f" ] && cronhits="$cronhits $f"
+	done
+	[ -n "$cronhits" ] && { any=1; add CRIT IOC "Suspicious cron jobs" "$(list_short "$cronhits")" persistence; }
+	for f in /etc/systemd/system/*.service /etc/systemd/system/*/*.service /root/.config/systemd/user/*.service /home/*/.config/systemd/user/*.service; do
+		[ -f "$f" ] && [ ! -L "$f" ] || continue
+		if grep -qE "^Exec[A-Za-z]*=.*(/tmp/|/dev/shm/|/var/tmp/)" "$f" 2>/dev/null || grep -qiE "$DL_EXEC_RE" "$f" 2>/dev/null; then
+			unitbad="$unitbad $f"
+		elif [ -n "$(find "$f" -newermt "$SINCE" 2>/dev/null)" ]; then
+			units="$units ${f##*/}"
+		fi
+	done
+	[ -n "$unitbad" ] && { any=1; add CRIT IOC "Suspicious systemd units" "$(list_short "$unitbad")" persistence; }
+	[ -n "$units" ] && { any=1; add MED CHECK "New/changed systemd units" "since $SINCE: $(list_short "$units")" persistence; }
+	for f in /root/.ssh/authorized_keys /root/.ssh/authorized_keys2 /home/*/.ssh/authorized_keys /home/*/.ssh/authorized_keys2; do
+		[ -f "$f" ] && [ -n "$(find "$f" -newermt "$SINCE" 2>/dev/null)" ] && keys="$keys $f"
+	done
+	[ -n "$keys" ] && { any=1; add MED CHECK "SSH keys changed" "since $SINCE: $(list_short "$keys")" persistence; }
+	sudo=$(find /etc/sudoers /etc/sudoers.d -newermt "$SINCE" -type f 2>/dev/null)
+	[ -n "$sudo" ] && { any=1; add MED CHECK "sudoers changed" "since $SINCE: $(list_short "$(oneline "$sudo")")" persistence; }
+	for f in $(find /tmp /var/tmp /dev/shm -xdev -maxdepth 3 -type f 2>/dev/null | head -n 500); do
+		[ "$(head -c 4 "$f" 2>/dev/null | tr -d '\177')" = ELF ] && elf="$elf $f"
+	done
+	[ -n "$elf" ] && { any=1; add HIGH CHECK "Binaries in temp dirs" "host: $(list_short "$elf")" persistence; }
+	suid=$(find /tmp /var/tmp /dev/shm /home -xdev -maxdepth 4 -type f -perm -4000 2>/dev/null | head -n 5)
+	[ -n "$suid" ] && { any=1; add CRIT IOC "SUID files in temp/home" "$(list_short "$(oneline "$suid")")" persistence; }
+	[ "$any" = 0 ] && add INFO OK "Persistence" "no preload hooks, extra root accounts, download-and-run cron jobs, rogue units or temp-dir binaries"
+	return 0
+}
+
 check_ioc() {
 	local procs ip conns hits="" tmpx="" pid exe any=0
 	procs=$(printf '%s\n' "$PS_OUT" | grep -E "$IOC_PROC_RE" | awk '{ $2 = ""; print substr($0, 1, 100) }' | head -n5)
@@ -875,7 +1257,41 @@ check_ioc() {
 		done
 		[ -n "$tmpx" ] && { any=1; add HIGH IOC "Processes running from temp dirs" "$(oneline "$tmpx" | cut -c1-200)" ioc; }
 	fi
-	[ "$any" = 0 ] && add CRIT OK "IOC sweep" "no known miner/proxy processes, attacker IPs or temp-dir binaries"
+	[ "$any" = 0 ] && add INFO OK "Processes & connections" "no known miner/proxy processes, attacker IPs or temp-dir binaries"
+	return 0
+}
+
+# Admin/editor accounts created in the window, read from each containerized WordPress database.
+# --deep only: it runs the site's wp-config.php (SHORTINIT: no plugins or themes) as www-data.
+wp_users_php() {
+	cat <<'EOF'
+<?php
+define('SHORTINIT', true);
+$_SERVER['HTTP_HOST'] = 'localhost';
+error_reporting(0);
+require getcwd() . '/wp-load.php';
+global $wpdb;
+$since = $argv[1];
+$sql = $wpdb->prepare("SELECT u.user_login, u.user_registered, m.meta_value FROM {$wpdb->users} u JOIN {$wpdb->usermeta} m ON m.user_id = u.ID AND m.meta_key = %s WHERE u.user_registered >= %s", $wpdb->prefix . 'capabilities', $since);
+foreach ((array) $wpdb->get_results($sql) as $r) {
+	if (preg_match('/administrator|editor/', $r->meta_value)) echo $r->user_login, ' (', $r->user_registered, ")\n";
+}
+EOF
+}
+
+check_wp_users_containers() {
+	[ "$OPT_DEEP" = 1 ] && [ -n "$CTR" ] || return 0
+	local name lbl image roots r admins
+	while IFS="$(printf '\t')" read -r name lbl image; do
+		[ -n "$name" ] || continue
+		roots=$(timeout 30 "$CTR" exec "$name" sh -c 'for d in /var/www /app /config/www; do [ -d "$d" ] && find "$d" -maxdepth 4 -name wp-load.php 2>/dev/null; done' 2>/dev/null)
+		for r in $roots; do
+			admins=$(wp_users_php | timeout 30 "$CTR" exec -i -u www-data -w "${r%/wp-load.php}" "$name" php -- "$SINCE" 2>/dev/null)
+			[ -n "$admins" ] && add CRIT IOC "WordPress new admins" "$lbl: created since $SINCE: $(oneline "$admins")" wp_ioc
+		done
+	done <<EOF
+$CTR_OUT
+EOF
 	return 0
 }
 
@@ -908,7 +1324,14 @@ rem_title() {
 	curl) echo "curl/libcurl HTTP/2 upload use-after-free (CVE-2026-92392)" ;;
 	ghostscript) echo "Ghostscript (CVE-2026-101258 / CVE-2026-103226)" ;;
 	siteguard) echo "SiteGuard Server Edition command injection (CVE-2026-106931)" ;;
-	ioc) echo "Indicators of compromise" ;;
+	ioc) echo "Attacker activity on this host" ;;
+	webshell) echo "Webshell / backdoor in a web root" ;;
+	wp_ioc) echo "WordPress changes to verify" ;;
+	persistence) echo "Persistence mechanisms" ;;
+	attempts) echo "Exploit attempts in logs" ;;
+	crash) echo "Web worker crashes (possible memory-corruption exploitation)" ;;
+	drift) echo "Container filesystem changed since start" ;;
+	cpu) echo "Possible cryptominer" ;;
 	containers) echo "Containers that could not be inspected" ;;
 	*) echo "$1" ;;
 	esac
@@ -916,17 +1339,21 @@ rem_title() {
 
 rem_body() {
 	case $1 in
-	php) cat <<EOF
-sudo apt update && sudo apt install --only-upgrade \$(dpkg-query -W -f='\${Package}\n' 'php*' 'libapache2-mod-php*' | grep -E '^(php|libapache2)')
-then restart every PHP process: sudo systemctl restart 'php*-fpm' apache2 (whichever you run)
-Containers: pull a fixed image (8.5.12 / 8.4.27 / 8.3.36 / 8.2.35+), then recreate — restarting is not enough:
-  docker compose pull && docker compose up -d --force-recreate
-Stopgap only: session.upload_progress.enabled = Off, limit request body size, restart workers.
-If this host was internet-facing before patching, look for webshells:
-  sudo find /var/www -name '*.php' -newermt $PHP2SHELL_DISCLOSED -ls
-Ref: https://ubuntu.com/blog/php2shell-vulnerability-fixes-available · https://security-tracker.debian.org/tracker/CVE-2026-109618
-EOF
-	;;
+	php)
+		case $(rem_scope php) in *host*)
+			echo "Host: sudo apt update && sudo apt install --only-upgrade \$(dpkg-query -W -f='\${Package}\\n' 'php*' 'libapache2-mod-php*' | grep -E '^(php|libapache2)')"
+			echo "      then restart every PHP process: sudo systemctl restart 'php*-fpm' apache2   (whichever you run)"
+			;;
+		esac
+		case $(rem_scope php) in *container*)
+			echo "Containers: rebuild on an image with PHP 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 or newer — restarting is not enough."
+			ctr_redeploy_hint "php -v"
+			;;
+		esac
+		echo "Stopgap only: session.upload_progress.enabled = Off, limit request body size, restart workers."
+		echo "Then check the \"Signs of exploitation\" section; re-run with --deep for a full webshell scan and new WordPress admins."
+		echo "Ref: https://ubuntu.com/blog/php2shell-vulnerability-fixes-available · https://security-tracker.debian.org/tracker/CVE-2026-109618"
+		;;
 	php_eol) cat <<EOF
 PHP ≤ 8.1 gets no upstream fix. Options:
   Ubuntu 14.04–20.04: sudo pro attach && sudo pro enable esm-apps (16.04/14.04 also need the Legacy add-on), then apt upgrade
@@ -938,7 +1365,7 @@ EOF
 	php_restart) echo "sudo systemctl restart 'php*-fpm' apache2   # whichever is in use; needrestart -r l lists all" ;;
 	nginx) cat <<'EOF'
 sudo apt update && sudo apt install --only-upgrade nginx 'nginx-*' && sudo nginx -t && sudo systemctl restart nginx
-nginx.org repo: upgrade to 1.30.6+ (stable) or 1.31.7+ (mainline). Containers: pull nginx:1.30.6+ and recreate.
+nginx.org repo: upgrade to 1.30.6+ (stable) or 1.31.7+ (mainline). Containers: rebuild on nginx 1.30.6+ / 1.31.7+.
 Distro builds without a backport yet — reduce exposure until one ships:
   • avoid `alias` combined with `rewrite` or $request_filename (CVE-2026-15176)
   • turn off `aio` or `ssi` where not needed (CVE-2026-97205)
@@ -950,7 +1377,7 @@ EOF
 	plex) cat <<EOF
 Update to Plex Media Server $PLEX_FIXED or later and verify the full build in Settings → General:
   sudo apt update && sudo apt install --only-upgrade plexmediaserver
-  Docker: docker compose pull && docker compose up -d --force-recreate
+  Containers: pull the image again and recreate (Compose: docker compose pull && docker compose up -d --force-recreate)
 Do not port-forward 32400 directly; use Plex Relay/VPN or restrict by firewall.
 If an older build was reachable from the internet, treat it as compromised — see "Possible Plex compromise".
 Ref: https://www.cisa.gov/known-exploited-vulnerabilities-catalog
@@ -1029,8 +1456,84 @@ identify the entry point (Plex, PHP app, Nextcloud, WordPress), rotate credentia
 Patching alone does not remove what an attacker already installed.
 EOF
 	;;
+	webshell) cat <<'EOF'
+Treat the site as compromised. Before deleting anything:
+  1. Preserve evidence: copy the files with timestamps (cp -a), save `stat <file>` output and the access-log
+     lines that requested them (grep the file name in the web server / container logs).
+  2. Find the entry point: what else changed around the same mtime?  find <webroot> -newermt '<mtime - 10 min>' ! -newermt '<mtime + 30 min>'
+  3. Clean: take the site offline, delete the backdoor, reinstall WordPress core and plugins from clean copies
+     (wp core download --force --skip-content; reinstall each plugin), or restore a backup from before the window.
+  4. Rotate the database password, WordPress salts (wp config shuffle-salts), every admin password and any API keys
+     in wp-config.php / .env. Containers: the backdoor lives on the volume, so recreating the container is not enough.
+EOF
+	;;
+	wp_ioc) cat <<'EOF'
+Verify each listed change is yours:
+  wp user list --role=administrator --fields=ID,user_login,user_email,user_registered
+  wp plugin list --status=must-use,dropin ; wp plugin list
+Unknown admin, mu-plugin or drop-in → treat as a backdoor (see the webshell steps): preserve, remove, reset all
+passwords and salts, delete UpdraftCentral keys (wp option delete updraft_central_localkeys).
+EOF
+	;;
+	persistence) cat <<'EOF'
+Persistence means an attacker had code execution. Preserve first (copy the file, `stat` it, note what it runs),
+then remove it, and find how they got in (web roots, Plex, Nextcloud, SSH). Safest: rebuild the host from clean
+media and restore data only; rotate SSH keys, passwords and any credentials stored on the machine.
+Review: crontab -l -u <user> ; systemctl cat <unit> ; ls -la ~/.ssh ; cat /etc/ld.so.preload
+EOF
+	;;
+	attempts) cat <<'EOF'
+Probes are normal internet noise; they matter when they hit a version that was vulnerable at the time.
+Memory-limit fatals are PHP2Shell's trigger condition: compare their timestamps with POST requests to PHP endpoints
+in the access log, and if PHP was unpatched at that time, look for new PHP files and admins (re-run with --deep).
+  docker logs --since <date> <container> 2>&1 | grep -E 'Allowed memory size|uploads/.*\.php'
+EOF
+	;;
+	crash) cat <<'EOF'
+Repeated segfaults of PHP / nginx / Plex workers are consistent with memory-corruption exploit attempts
+(PHP2Shell, NGINX CVE-2026-15176 / -97205). Patch first, then review files changed around each crash time:
+  find <webroot> -newermt '<crash time - 5 min>' ! -newermt '<crash time + 30 min>'
+EOF
+	;;
+	drift) cat <<'EOF'
+Files were added or changed inside the container (outside its volumes) after it started — not from the image.
+Inspect:  docker diff <container> ; docker exec <container> ls -la <path>
+Preserve: docker export <container> > evidence.tar   (recreating the container discards these changes)
+Then recreate it from a clean, patched image and check its volumes with the webshell steps.
+EOF
+	;;
+	cpu) cat <<'EOF'
+Identify the process before killing it:
+  ps -o pid,ppid,user,etime,args -p <pid> ; ls -l /proc/<pid>/exe ; ss -tnp | grep 'pid=<pid>,'
+Miners usually connect to pool ports such as 3333, 4444, 5555, 7777 or 14444. If it's a miner, follow "Attacker activity".
+EOF
+	;;
 	containers) echo "Check those images' PHP / NGINX / Plex versions against the fixed versions above, e.g. docker image inspect." ;;
 	esac
+}
+
+# rem_scope KEY → "host", "container" or "host container": where KEY's open findings are
+rem_scope() {
+	local i h="" c=""
+	for ((i = 0; i < ${#F_REM[@]}; i++)); do
+		[ "${F_REM[$i]}" = "$1" ] || continue
+		case ${F_STAT[$i]} in OK | N/A | SKIPPED) continue ;; esac
+		case ${F_DETAIL[$i]} in "container "* | "service "*) c=container ;; *) h=host ;; esac
+	done
+	printf '%s %s' "$h" "$c"
+}
+
+# ctr_redeploy_hint VERIFY-CMD: how to recreate containers for the detected orchestration
+ctr_redeploy_hint() {
+	if [ "$CAPROVER" = 1 ]; then
+		echo "  CapRover: for each app, redeploy on a fixed image — Deployment → \"Deploy via ImageName\" with a tag"
+		echo "  published after the fix, or bump FROM in the app's Dockerfile and redeploy (docker pull the base first)."
+	elif [ "$SWARM" = 1 ]; then
+		echo "  Swarm: docker service update --force --image <image>:<fixed-tag> <service>"
+	else
+		echo "  Compose: docker compose pull && docker compose up -d --force-recreate"
+	fi
+	echo "  Verify inside each container afterwards: docker exec <container> $1"
 }
 
 # ---------------------------------------------------------------------------
@@ -1046,38 +1549,67 @@ sorted_indices() {
 	done | sort | awk '{ print $3 + 0 }'
 }
 
+# verdict → "clean", "review" or "compromised" (from the exploitation section, INFO rows excluded)
+verdict() {
+	local i v=clean
+	for ((i = 0; i < ${#F_STAT[@]}; i++)); do
+		[ "${F_KIND[$i]}" = ioc ] && [ "${F_SEV[$i]}" != INFO ] || continue
+		case ${F_STAT[$i]} in
+		IOC) v=compromised ;;
+		CHECK) [ "$v" = clean ] && v=review ;;
+		esac
+	done
+	printf '%s' "$v"
+}
+
 render_text() {
-	local c_red="" c_yel="" c_grn="" c_dim="" c_bold="" c_off="" i idx keys=" " key n=0 col sev
+	local c_red="" c_yel="" c_grn="" c_dim="" c_bold="" c_off="" idx keys=" " key n col sev kind
 	if [ "$OPT_COLOR" != never ] && [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
 		c_red=$'\033[31m' c_yel=$'\033[33m' c_grn=$'\033[32m' c_dim=$'\033[2m' c_bold=$'\033[1m' c_off=$'\033[0m'
 	fi
 	local rule="──────────────────────────────────────────────────────────────────────"
 	printf '%soct2026-scan %s%s · %s · %s · kernel %s · %s\n' "$c_bold" "$SCAN_VERSION" "$c_off" "$HOST" "$OS_PRETTY" "$KREL" \
 		"$([ "$IS_ROOT" = 1 ] && echo "root ✓" || echo "not root: partial scan")"
-	printf '%sfix data as of %s — latest: https://github.com/alex-red/2026-october-security-scan%s\n%s\n' "$c_dim" "$DATA_DATE" "$c_off" "$rule"
+	printf '%sfix data as of %s — latest: https://github.com/alex-red/2026-october-security-scan%s\n' "$c_dim" "$DATA_DATE" "$c_off"
 	local order rems="" refs
 	order=$(sorted_indices)
-	# Assign remediation numbers in display order
-	for idx in $order; do
-		key=${F_REM[$idx]}
-		case ${F_STAT[$idx]} in OK | N/A | SKIPPED) continue ;; esac
-		[ -n "$key" ] || continue
-		case $keys in *" $key "*) ;; *) keys="$keys$key " rems="$rems $key" ;; esac
+	# Remediation numbers follow display order: vulnerabilities first, then evidence
+	for kind in vuln ioc; do
+		for idx in $order; do
+			[ "${F_KIND[$idx]}" = "$kind" ] || continue
+			key=${F_REM[$idx]}
+			case ${F_STAT[$idx]} in OK | N/A | SKIPPED) continue ;; esac
+			[ -n "$key" ] || continue
+			case $keys in *" $key "*) ;; *) keys="$keys$key " rems="$rems $key" ;; esac
+		done
 	done
-	for idx in $order; do
-		case ${F_STAT[$idx]} in
-		IOC | VULNERABLE) col=$c_red ;;
-		CHECK) col=$c_yel ;;
-		OK) col=$c_grn ;;
-		*) col=$c_dim ;;
-		esac
-		case ${F_STAT[$idx]} in OK | N/A | SKIPPED) [ "$OPT_QUIET" = 1 ] && continue; sev="" ;; *) sev=${F_SEV[$idx]} ;; esac
-		refs=""
-		if [ -n "${F_REM[$idx]}" ] && [ "$sev" != "" ]; then
-			n=0
-			for key in $rems; do n=$((n + 1)); [ "$key" = "${F_REM[$idx]}" ] && refs=" [$n]"; done
+	for kind in vuln ioc; do
+		if [ "$kind" = vuln ]; then
+			printf '\n%sVulnerabilities%s\n%s\n' "$c_bold" "$c_off" "$rule"
+		else
+			case $(verdict) in
+			compromised) v="${c_red}${c_bold}LIKELY COMPROMISED — indicators found${c_off}" ;;
+			review) v="${c_yel}${c_bold}REVIEW — findings that could mean exploitation${c_off}" ;;
+			*) v="${c_grn}${c_bold}no signs of exploitation found${c_off} ${c_dim}(not proof of a clean host)${c_off}" ;;
+			esac
+			printf '\n%sSigns of exploitation since %s:%s %s\n%s\n' "$c_bold" "$SINCE" "$c_off" "$v" "$rule"
 		fi
-		printf '%-4s  %s%-10s%s  %-30s %s%s\n' "$sev" "$col" "${F_STAT[$idx]}" "$c_off" "${F_COMP[$idx]}" "${F_DETAIL[$idx]}" "$refs"
+		for idx in $order; do
+			[ "${F_KIND[$idx]}" = "$kind" ] || continue
+			case ${F_STAT[$idx]} in
+			IOC | VULNERABLE) col=$c_red ;;
+			CHECK) col=$c_yel ;;
+			OK) col=$c_grn ;;
+			*) col=$c_dim ;;
+			esac
+			case ${F_STAT[$idx]} in OK | N/A | SKIPPED) [ "$OPT_QUIET" = 1 ] && continue; sev="" ;; *) sev=${F_SEV[$idx]} ;; esac
+			refs=""
+			if [ -n "${F_REM[$idx]}" ] && [ "$sev" != "" ]; then
+				n=0
+				for key in $rems; do n=$((n + 1)); [ "$key" = "${F_REM[$idx]}" ] && refs=" [$n]"; done
+			fi
+			printf '%-4s  %s%-10s%s  %-30s %s%s\n' "$sev" "$col" "${F_STAT[$idx]}" "$c_off" "${F_COMP[$idx]}" "${F_DETAIL[$idx]}" "$refs"
+		done
 	done
 	printf '%s\n' "$rule"
 	if [ -n "$rems" ]; then
@@ -1092,7 +1624,8 @@ render_text() {
 	else
 		printf '%sNothing to fix from this list.%s\n' "$c_grn" "$c_off"
 	fi
-	[ "$IS_ROOT" = 1 ] || printf '%sNot root: nginx config, other users'"'"' files, containers and stale-process checks were limited. Re-run with sudo.%s\n' "$c_yel" "$c_off"
+	[ "$IS_ROOT" = 1 ] || printf '%sNot root: nginx config, other users'"'"' files, containers, logs and process checks were limited. Re-run with sudo.%s\n' "$c_yel" "$c_off"
+	[ "$OPT_DEEP" = 1 ] || printf '%sFor a full webshell scan of all PHP files and new WordPress admins, re-run with --deep.%s\n' "$c_dim" "$c_off"
 	printf '%sUpdating stops new exploitation but does not remove an existing compromise. Re-run after patching/rebooting.%s\n' "$c_dim" "$c_off"
 }
 
@@ -1108,14 +1641,14 @@ json_str() {
 
 render_json() {
 	local idx first=1 keys=" " key
-	printf '{"scanner":"oct2026-scan","version":%s,"data_date":%s,"host":%s,"os":%s,"kernel":%s,"root":%s,"findings":[' \
+	printf '{"scanner":"oct2026-scan","version":%s,"data_date":%s,"host":%s,"os":%s,"kernel":%s,"root":%s,"since":%s,"verdict":%s,"findings":[' \
 		"$(json_str "$SCAN_VERSION")" "$(json_str "$DATA_DATE")" "$(json_str "$HOST")" "$(json_str "$OS_PRETTY")" \
-		"$(json_str "$KREL")" "$([ "$IS_ROOT" = 1 ] && echo true || echo false)"
+		"$(json_str "$KREL")" "$([ "$IS_ROOT" = 1 ] && echo true || echo false)" "$(json_str "$SINCE")" "$(json_str "$(verdict)")"
 	for idx in $(sorted_indices); do
 		[ "$first" = 1 ] || printf ','
 		first=0
-		printf '{"severity":%s,"status":%s,"component":%s,"detail":%s,"remediation":%s}' \
-			"$(json_str "${F_SEV[$idx]}")" "$(json_str "${F_STAT[$idx]}")" "$(json_str "${F_COMP[$idx]}")" \
+		printf '{"kind":%s,"severity":%s,"status":%s,"component":%s,"detail":%s,"remediation":%s}' \
+			"$(json_str "${F_KIND[$idx]}")" "$(json_str "${F_SEV[$idx]}")" "$(json_str "${F_STAT[$idx]}")" "$(json_str "${F_COMP[$idx]}")" \
 			"$(json_str "${F_DETAIL[$idx]}")" "$(json_str "${F_REM[$idx]}")"
 		key=${F_REM[$idx]}
 		[ -n "$key" ] && case $keys in *" $key "*) ;; *) keys="$keys$key " ;; esac
@@ -1147,7 +1680,11 @@ main() {
 	parse_args "$@"
 	[ "$(uname -s)" = Linux ] || { echo "oct2026-scan only runs on Linux" >&2; exit 3; }
 	detect_env
+	local d
+	d=$(( ($(date +%s) - $(date -d "$SINCE" +%s 2>/dev/null || date +%s)) / 86400 + 1 ))
+	[ "$d" -gt 0 ] && DAYS=$d
 	[ "$OPT_JSON" = 1 ] || [ ! -t 2 ] || printf 'scanning…\r' >&2
+	CUR_KIND=vuln
 	check_containers
 	check_php
 	check_nginx
@@ -1158,8 +1695,17 @@ main() {
 	check_curl
 	check_simple_pkg ghostscript ghostscript MED ghostscript "Ghostscript"
 	check_siteguard
-	check_ioc
 	check_exposure
+	CUR_KIND=ioc
+	check_containers_ioc
+	check_wp_users_containers
+	check_host_webroots_ioc
+	check_host_logs
+	check_web_children
+	check_net_shells
+	check_cpu
+	check_persistence
+	check_ioc
 	[ "$OPT_JSON" = 1 ] || [ ! -t 2 ] || printf '           \r' >&2
 	if [ "$OPT_JSON" = 1 ]; then render_json; else render_text; fi
 	exit_code

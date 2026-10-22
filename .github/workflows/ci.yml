@@ -34,4 +34,5 @@ jobs:
             bash /w/oct2026-scan.sh --no-docker --no-color; rc=$?
             echo "exit code: $rc"; [ "$rc" -le 2 ] || exit 1
             bash /w/oct2026-scan.sh --no-docker --json > /tmp/out.json; [ $? -le 2 ] || exit 1
-            grep -q "\"scanner\":\"oct2026-scan\"" /tmp/out.json'
+            grep -q "\"verdict\":\"clean\"" /tmp/out.json || { cat /tmp/out.json; exit 1; }
+            bash /w/oct2026-scan.sh --no-docker --deep --since 2026-09-01 --no-color; [ $? -le 2 ] || exit 1'

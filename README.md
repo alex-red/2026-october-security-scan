@@ -26,25 +26,47 @@ It runs without root, but then it can't read nginx config, other users' files or
 | Ghostscript | CVE-2026-101258, CVE-2026-103226 | Distro updates (USN-8949-1, DSA-6550-1) | — |
 | SiteGuard Server Edition | CVE-2026-106931 | 8.00 Update 5 / 7.00 Update 6 | Yes |
 
-It also runs:
+It also checks for **signs that the server was already exploited**; see [Signs of exploitation](#signs-of-exploitation).
+
+Other checks:
 
 - **Container check.** It runs a small read-only probe inside each running Docker or Podman container, reporting PHP, NGINX, Plex, Nextcloud and UpdraftPlus versions *inside* the container. The host's packages don't tell you what a container runs.
 - **Patched but not restarted.** It finds PHP and nginx processes still running an old (deleted) binary.
 - **Fixed kernel installed but not booted.** It spots a fixed kernel package that the host hasn't rebooted into yet.
-- **Indicator sweep.** It looks for the published miner and proxy process names, active connections to published attacker IPs, processes running from `/tmp`, `/var/tmp` or `/dev/shm`, top-level `.so` files in Plex's `Codecs/` directory, unexpected Plex child processes, Nextcloud `shx*.php` webshells, `proxy.php` injection attempts in access logs, and WordPress plugins or mu-plugins changed since 2026-10-17.
 - **Exposure.** It lists which relevant ports listen on non-loopback addresses.
+
+## Signs of exploitation
+
+Patching stops new attacks but doesn't undo old ones. The second half of the report looks for what these attack paths leave behind. Each check runs on the host and inside every running container, and the section starts with a one-line verdict: **no signs found**, **REVIEW**, or **LIKELY COMPROMISED**.
+
+| Where | What it looks for |
+|---|---|
+| Web roots | PHP files inside upload folders (`wp-content/uploads`, Drupal `files`, Laravel `storage`) · webshell code (`eval(base64_decode(…))`, `system($_POST…)`, known shell kits) in recently changed PHP files, or in **all** PHP files with `--deep` · `auto_prepend_file` in `.user.ini`/`.htaccess` (Wordfence and similar allow-listed) |
+| WordPress | mu-plugins, drop-ins (`db.php`, `object-cache.php`) and plugin folders changed in the window; plugin changes on sites with UpdraftPlus are flagged higher · with `--deep`: admin/editor accounts created in the window, read from the site database |
+| Logs | Successful requests to PHP files in `uploads/` · PHP memory-limit fatals (PHP2Shell's trigger condition) · segfaults of PHP/nginx/Apache/Plex workers, from web, PHP-FPM, kernel and container logs · injection probes (counted, informational) |
+| Processes | Shells or download tools running under php-fpm/Apache/nginx · shells or netcat holding network connections (reverse shells) · long-running CPU hogs (miners) · binaries running from `/tmp`, `/var/tmp`, `/dev/shm` · published miner/proxy names and attacker IPs |
+| Persistence | `/etc/ld.so.preload` · extra UID 0 accounts · web users with login shells · download-and-run cron jobs or crontabs for `www-data` · systemd units running from temp dirs, or changed in the window · SSH `authorized_keys` and sudoers changed in the window · ELF and SUID files in temp dirs |
+| Containers | `docker diff`: cron jobs, SSH keys, preload hooks or new binaries added inside a container since it started (outside its volumes) |
+
+The window starts at **2026-10-01** by default (`--since YYYY-MM-DD` to change it). Nextcloud CODE checks look back to 2026-09-10, when exploitation of that bug began.
+
+**What it can't tell you:** a clean result is not proof of a clean server. Attackers delete logs and files, logs rotate, and container logs disappear when a container is recreated. Weak signals (memory fatals, plugin updates, changed systemd units) are marked `CHECK` because they're often your own activity. Strong ones (PHP in uploads, webshell code, reverse shells, preload hooks) are `IOC`.
+
+`--deep` reads each containerized WordPress site's database to list new admins. It does this by running the site's `wp-config.php` with WordPress's `SHORTINIT` (no plugins or themes) as `www-data` inside the container. That's the only check that executes site code; it is off by default.
 
 ## Options
 
 ```
 --json        machine-readable output
 --no-docker   don't inspect containers
---deep        wider filesystem search, rotated logs, WordPress user audit via wp-cli
+--deep        wider filesystem search, rotated logs, webshell scan of all PHP files,
+              new WordPress admins (reads the site database)
+--since DATE  start of the lookback for signs of exploitation (default 2026-10-01)
 -q, --quiet   hide OK / N/A rows
 --no-color    plain output (NO_COLOR is honoured too)
 ```
 
-`--deep` runs wp-cli as the site's file owner with `--skip-plugins --skip-themes`, so possibly backdoored plugin code isn't loaded.
+On the host, `--deep` uses wp-cli as the site's file owner with `--skip-plugins --skip-themes`, so possibly backdoored plugin code isn't loaded.
 
 **Exit codes:** `0` nothing found · `1` something needs review · `2` vulnerable or indicator of compromise · `3` error. Use them from cron, Ansible and similar tools.
 
@@ -86,6 +108,7 @@ Ubuntu and Debian **backport** fixes, so their package versions look older than 
 - **A clean result is not proof of a clean host.** Updating stops new exploitation; it does not remove a backdoor installed earlier. For anything that was internet-facing and vulnerable (PHP, Plex, Nextcloud CODE, UpdraftCentral-connected WordPress), do a proper compromise review.
 - **Exposure is approximate.** "Listens on all interfaces" doesn't mean "reachable from the internet". Port forwarding, firewalls and Plex Relay change that.
 - **Containers without a shell** (distroless images) can't be probed and are listed for manual checking.
+- **Sites are checked once.** A host folder bind-mounted into a container's web root is checked through the container, not again on the host.
 - **RPM distros** (RHEL, Alma, Rocky) aren't targeted. On those, most checks fall back to `CHECK` or `N/A`.
 
 ## Notes from source verification (2026-10-22)
