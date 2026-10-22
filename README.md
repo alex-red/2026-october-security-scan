@@ -46,7 +46,7 @@ Patching stops new attacks but doesn't undo old ones. The second half of the rep
 | Logs | Successful requests to PHP files in `uploads/` · PHP memory-limit fatals (PHP2Shell's trigger condition) · segfaults of PHP/nginx/Apache/Plex workers, from web, PHP-FPM, kernel and container logs · injection probes, sorted by response: all rejected (4xx/3xx, or just the homepage) is reported as **failed**; a 2xx elsewhere or a 5xx is **reached app**, flagged for a closer look · IPs that sent probes and then made successful POSTs to PHP files |
 | Processes | Shells or download tools running under php-fpm/Apache/nginx · shells or netcat holding network connections (reverse shells) · long-running CPU hogs (miners) · binaries running from `/tmp`, `/var/tmp`, `/dev/shm` · published miner/proxy names and attacker IPs |
 | Persistence | `/etc/ld.so.preload` · extra UID 0 accounts · web users with login shells · download-and-run cron jobs or crontabs for `www-data` · systemd units running from temp dirs, or changed in the window · SSH `authorized_keys` and sudoers changed in the window · ELF and SUID files in temp dirs |
-| Containers | `docker diff`: cron jobs, SSH keys, preload hooks or new binaries added inside a container since it started (outside its volumes) |
+| Containers | `docker diff`: preload hooks, SSH keys, cron jobs (judged by what they run), extra root accounts, or new binaries in a container's own filesystem. Changes made by the image's startup (within 5 minutes of creation or the latest start, by inode ctime), volume mount points and bytecode caches are ignored |
 
 The window starts at **2026-10-01** by default (`--since YYYY-MM-DD` to change it). Nextcloud CODE checks look back to 2026-09-10, when exploitation of that bug began.
 

@@ -13,7 +13,7 @@
 set -u
 set -o pipefail
 
-SCAN_VERSION="1.1.1"
+SCAN_VERSION="1.1.2"
 DATA_DATE="2026-10-22"
 
 # ---------------------------------------------------------------------------
@@ -259,6 +259,7 @@ OS_ID=unknown
 OS_CODENAME=""
 OS_PRETTY=""
 IS_PVE=0
+IS_UNRAID=0
 KREL=""
 KVER=""
 HOST=""
@@ -298,6 +299,11 @@ detect_env() {
 		# Ubuntu derivatives (Mint, Pop!_OS…) use Ubuntu's packages
 		case " $like " in *" ubuntu "*) [ -n "$ucn" ] && { OS_ID=ubuntu; OS_CODENAME=$ucn; } ;; esac
 	fi
+	if [ -r /etc/unraid-version ]; then
+		IS_UNRAID=1
+		OS_ID=unraid OS_CODENAME=""
+		OS_PRETTY="Unraid $(sed -n 's/^version="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' /etc/unraid-version)"
+	fi
 	if have pveversion || [ -d /etc/pve ]; then
 		IS_PVE=1
 		local pv
@@ -331,6 +337,22 @@ public_port() {
 		  if (port == p && addr !~ /^(127\.|\[::1\]|::1|\[::ffff:127\.)/) f = 1 }
 		END { exit !f }'
 }
+
+# listen_scope PORT → "all" (0.0.0.0 / ::), "public" (a public IP), "private" (LAN / VPN
+# addresses only) or nothing when PORT only listens on loopback or not at all
+listen_scope() {
+	printf '%s\n' "$LISTEN" | awk -v p="$1" '
+		{
+			n = split($1, a, ":"); port = a[n]; addr = substr($1, 1, length($1) - length(port) - 1)
+			gsub(/^\[|\]$/, "", addr); sub(/%.*/, "", addr)
+			if (port != p || addr ~ /^(127\.|::1$|::ffff:127\.)/) next
+			if (addr == "0.0.0.0" || addr == "*" || addr == "::" || addr == "") s["all"] = 1
+			else if (addr ~ /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|169\.254\.|f[cd]|fe80)/) s["private"] = 1
+			else s["public"] = 1
+		}
+		END { if ("all" in s) print "all"; else if ("public" in s) print "public"; else if ("private" in s) print "private" }'
+}
+scope_text() { case $1 in all) echo "all interfaces" ;; public) echo "a public IP" ;; private) echo "LAN/VPN addresses only" ;; esac; }
 
 # apt_pending INSTALLED-VERSION BINARY-PKG → candidate version if apt knows a newer one
 apt_pending() {
@@ -434,7 +456,9 @@ eval_plex() {
 	up=$(upstream "$2")
 	PLEX_SEEN=1
 	if vlt "$up" "$PLEX_FIXED"; then
-		public_port 32400 && exp="; port 32400 listens on all interfaces — assume compromise"
+		case $(listen_scope 32400) in
+		all | public) exp="; port 32400 listens on $(scope_text "$(listen_scope 32400)") — if it was reachable from the internet, assume compromise" ;;
+		esac
 		add CRIT VULNERABLE "Plex Media Server $up" "$label: < $PLEX_FIXED$exp" plex
 	else
 		add CRIT OK "Plex Media Server $up" "$label: ≥ $PLEX_FIXED"
@@ -588,7 +612,7 @@ php_upload_progress() {
 }
 
 check_nginx() {
-	local ver bin v risky="" conf extra="" stale
+	local ver bin v risky="" conf extra="" stale scope
 	ver=$(pkg_version nginx)
 	[ -n "$ver" ] || ver=$(src_versions '^nginx$' | cut -f2 | head -n1)
 	bin=$(command -v nginx 2>/dev/null || { [ -x /usr/sbin/nginx ] && echo /usr/sbin/nginx; })
@@ -601,7 +625,9 @@ check_nginx() {
 		return
 	fi
 	if [ -n "$bin" ] && [ "$IS_ROOT" = 1 ]; then
-		conf=$(timeout 10 "$bin" -T 2>/dev/null | sed 's/#.*//')
+		# -q -e /dev/null: don't write config-test warnings into nginx's error log (older nginx lacks -e)
+		conf=$(timeout 10 "$bin" -T -q -e /dev/null 2>/dev/null || timeout 10 "$bin" -T -q 2>/dev/null)
+		conf=$(printf '%s\n' "$conf" | sed 's/#.*//')
 		if [ -n "$conf" ]; then
 			# shellcheck disable=SC2016 # literal nginx variable name
 			printf '%s\n' "$conf" | grep -qE '^[[:space:]]*alias[[:space:]]' &&
@@ -614,8 +640,10 @@ check_nginx() {
 		fi
 	fi
 	[ -n "$risky" ] && extra="; config uses:$risky"
-	public_port 443 || public_port 80 && extra="$extra; listens publicly on 80/443"
-	eval_nginx "host package" "$ver" "$extra"
+	scope=$(listen_scope 443)
+	[ -n "$scope" ] || scope=$(listen_scope 80)
+	[ -n "$scope" ] && extra="$extra; 80/443 on $(scope_text "$scope")"
+	eval_nginx "host" "$ver" "$extra"
 	stale=$(stale_procs 'nginx: (master|worker)' 'nginx')
 	[ "$stale" -gt 0 ] && add HIGH CHECK "NGINX workers" "$stale process(es) still run a replaced nginx binary — restart nginx" nginx_restart
 	return 0
@@ -896,15 +924,18 @@ check_containers() {
 		fi
 		return
 	fi
-	local ids name image svc mounts m src dst out lbl n=0 noshell=""
+	local ids name image svc started created mounts m src dst out lbl n=0 noshell=""
 	ids=$("$CTR" ps -q 2>/dev/null)
 	[ -n "$ids" ] || { add INFO OK "Containers" "no running containers"; return; }
+	# "|"-separated: with tabs, read would merge an empty service-name field with the next one
 	# shellcheck disable=SC2086
-	while IFS="$(printf '\t')" read -r name image svc mounts; do
+	while IFS='|' read -r name image svc started created mounts; do
 		[ -n "$name" ] || continue
 		n=$((n + 1))
 		name=${name#/}
 		image=${image%%@sha256:*}
+		started=$(date -d "$started" +%s 2>/dev/null || echo 0)
+		created=$(date -d "$created" +%s 2>/dev/null || echo 0)
 		[ "$svc" = "<no value>" ] && svc=""
 		[ -n "$svc" ] && SWARM=1
 		case "$name $svc" in captain-* | *srv-captain--*) CAPROVER=1 ;; esac
@@ -919,14 +950,14 @@ check_containers() {
 $(ioc_probe)" probe "$DAYS" "$OPT_DEEP" "$WEBSHELL_RE" "$DL_EXEC_RE" 1 /var/www /app /config/www /srv /usr/share/nginx/html 2>/dev/null); then
 			[ -n "$out" ] || { noshell="$noshell $name"; continue; }
 		fi
-		CTR_OUT="${CTR_OUT}${name}	${lbl}	${image}
+		CTR_OUT="${CTR_OUT}${name}|${lbl}|${image}|${started}|${created}|$(printf '%s' "$mounts" | tr ';' '\n' | sed -n 's/^[^>]*>//p' | tr '\n' ' ')
 "
 		eval_container "$lbl" "$image" "$out"
 		CTR_IOC_OUT="${CTR_IOC_OUT}@@${lbl}
 ${out}
 "
 	done <<EOF
-$("$CTR" inspect -f '{{.Name}}	{{.Config.Image}}	{{index .Config.Labels "com.docker.swarm.service.name"}}	{{range .Mounts}}{{.Source}}>{{.Destination}};{{end}}' $ids 2>/dev/null)
+$("$CTR" inspect -f '{{.Name}}|{{.Config.Image}}|{{index .Config.Labels "com.docker.swarm.service.name"}}|{{.State.StartedAt}}|{{.Created}}|{{range .Mounts}}{{.Source}}>{{.Destination}};{{end}}' $ids 2>/dev/null)
 EOF
 	[ -n "$noshell" ] && add MED CHECK "Containers without shell" "could not inspect:$noshell — check their image versions manually" containers
 	add INFO OK "Containers" "$n running container(s) inspected via $CTR exec"
@@ -1105,19 +1136,77 @@ EOF
 	return 0
 }
 
-# eval_drift LABEL "docker diff" output — files changed in the container's writable layer
+# Seconds after a container is created (its first start) or last started during which its own
+# entrypoint changes files: linuxserver crontabs, PUID user mapping, DOCKER_MODS packages, runit
+# links. Docker only records those two times, so a change made at an intermediate restart can
+# still show up; account files are therefore judged by content instead.
+STARTUP_GRACE=300
+
+# ctr_stat CONTAINER < PATHS → "EPOCH PATH" per path: the inode change time (ctime) of the path
+# itself. ctime is set when a file lands in the container, even if a package/archive kept an
+# old mtime, and it can't be set back without changing the clock.
+ctr_stat() {
+	timeout 30 "$CTR" exec -i "$1" sh -c 'xargs stat -c "%Z %n"' 2>/dev/null
+}
+ctr_cat() { timeout 20 "$CTR" exec "$1" cat "$2" 2>/dev/null | head -c 4000; }
+
+# eval_drift LABEL "docker diff"-OUTPUT [CONTAINER STARTED-EPOCH]
+# Files changed in the container's writable layer. With a container given, changes made in
+# its startup window are dropped, and cron files are judged by what they run.
 eval_drift() {
-	local lbl=$1 res ioc chk
-	res=$(printf '%s\n' "$2" | awk '
+	local lbl=$1 name=${3:-} started=${4:-0} dests=${5:-} created=${6:-0} res stats line kind p ioc="" cron="" chk="" content
+	res=$(printf '%s\n' "$2" | awk -v dests=" $dests " '
 		{ t = $1; p = $2 }
 		p ~ /^\/(proc|sys|dev|run|var\/run|var\/lock|var\/log|var\/cache|tmp|var\/tmp)(\/|$)/ { next }
-		t != "D" && p ~ /^\/etc\/ld\.so\.preload$|^\/etc\/cron[^\/]*\/.|^\/etc\/crontabs\/.|^\/var\/spool\/cron\/.|^\/root\/\.ssh\/./ { print "ioc " p; next }
-		t != "D" && p ~ /^\/etc\/(passwd|shadow|sudoers)/ { print "chk " p; next }
+		p == "/sbin/docker-init" || p ~ /\/__pycache__(\/|$)|\.pyc$/ { next }
+		# volume mount points (and their parents) are created by docker, not by the container
+		index(dests, " " p " ") || index(dests, " " p "/") { next }
+		t != "D" && p ~ /^\/etc\/ld\.so\.preload$|^\/root\/\.ssh\/./ { print "ioc " p; next }
+		t != "D" && p ~ /^\/etc\/cron[^\/]*\/.|^\/etc\/crontabs\/.|^\/var\/spool\/cron\/./ { print "cron " p; next }
+		t != "D" && p == "/etc/passwd" { print "acct " p; next }
+		p ~ /^\/etc\/(passwd-|shadow-?|group-?|gshadow-?)$/ { next }
+		t != "D" && p ~ /^\/etc\/sudoers/ { print "chk " p; next }
 		t == "A" && p ~ /^\/(usr|bin|sbin|lib|lib64|opt|etc\/init\.d|etc\/systemd|etc\/profile\.d)\/./ { print "chk " p }')
-	ioc=$(printf '%s\n' "$res" | sed -n 's/^ioc //p')
-	chk=$(printf '%s\n' "$res" | sed -n 's/^chk //p')
-	[ -n "$ioc" ] && add CRIT IOC "Container persistence" "$lbl: $(list_short "$(oneline "$ioc")")" drift
-	[ -n "$chk" ] && add MED CHECK "Container files changed" "$lbl: outside volumes: $(list_short "$(oneline "$chk")")" drift
+	[ -n "$res" ] || return 0
+	if [ -n "$name" ] && [ "$started" -gt 0 ]; then
+		stats=$(printf '%s\n' "$res" | cut -d' ' -f2- | ctr_stat "$name")
+		if [ -n "$stats" ]; then
+			# keep only paths changed before this start or after its startup window (streamed: can be thousands)
+			res=$({ printf '%s\n' "$stats"; echo "@@"; printf '%s\n' "$res"; } | awk -v s="$started" -v c="$created" -v g="$STARTUP_GRACE" '
+				function near(x, t) { return t > 0 && x >= t - 5 && x <= t + g }
+				$0 == "@@" { body = 1; next }
+				!body { if (!near($1, s) && !near($1, c)) keep[$2] = 1; next }
+				$2 in keep')
+		fi
+		[ -n "$res" ] || return 0
+	fi
+	while read -r kind p; do
+		case $kind in
+		ioc) ioc="$ioc $p" ;;
+		chk) chk="$chk $p" ;;
+		acct)
+			# PUID/PGID mapping rewrites passwd at start; only an extra UID 0 account matters
+			content=""
+			[ -n "$name" ] && content=$(ctr_cat "$name" /etc/passwd | awk -F: '$3 == 0 && $1 != "root" { printf "%s ", $1 }')
+			[ -n "${content:-}" ] && ioc="$ioc /etc/passwd(extra root: ${content% })"
+			[ -z "$name" ] && chk="$chk $p"
+			;;
+		cron)
+			content=""
+			[ -n "$name" ] && content=$(ctr_cat "$name" "$p")
+			if printf '%s' "$content" | grep -qiE "$DL_EXEC_RE|/tmp/|/dev/shm/|/var/tmp/"; then
+				ioc="$ioc $p"
+			else
+				cron="$cron $p"
+			fi
+			;;
+		esac
+	done <<EOF
+$res
+EOF
+	[ -n "$ioc" ] && add CRIT IOC "Container persistence" "$lbl: $(list_short "$ioc")" drift
+	[ -n "$cron" ] && add HIGH CHECK "Cron changed after start" "$lbl: $(list_short "$cron") — review what it runs" drift
+	[ -n "$chk" ] && add MED CHECK "Container files changed" "$lbl: outside volumes: $(list_short "$chk")" drift
 	return 0
 }
 
@@ -1128,7 +1217,7 @@ eval_ctr_block() { # LABEL PROBE-OUTPUT
 # Evidence collected per container: probe results, logs, filesystem drift
 check_containers_ioc() {
 	[ -n "$CTR" ] || return 0
-	local line lbl="" out="" name image logs
+	local line lbl="" out="" name image logs started created dests
 	# Probe output blocks are separated by "@@LABEL" lines
 	while IFS= read -r line; do
 		case $line in
@@ -1143,11 +1232,11 @@ check_containers_ioc() {
 $CTR_IOC_OUT
 EOF
 	[ -n "$lbl" ] && eval_ctr_block "$lbl" "$out"
-	while IFS="$(printf '\t')" read -r name lbl image; do
+	while IFS='|' read -r name lbl image started created dests; do
 		[ -n "$name" ] || continue
 		logs=$(timeout 60 "$CTR" logs --since "$SINCE" "$name" 2>&1 | log_counts)
 		eval_log_counts "$lbl" "$logs"
-		eval_drift "$lbl" "$(timeout 30 "$CTR" diff "$name" 2>/dev/null)"
+		eval_drift "$lbl" "$(timeout 30 "$CTR" diff "$name" 2>/dev/null)" "$name" "$started" "$dests" "$created"
 	done <<EOF
 $CTR_OUT
 EOF
@@ -1266,7 +1355,20 @@ check_persistence() {
 	for f in /root/.ssh/authorized_keys /root/.ssh/authorized_keys2 /home/*/.ssh/authorized_keys /home/*/.ssh/authorized_keys2; do
 		[ -f "$f" ] && [ -n "$(find "$f" -newermt "$SINCE" 2>/dev/null)" ] && keys="$keys $f"
 	done
-	[ -n "$keys" ] && { any=1; add MED CHECK "SSH keys changed" "since $SINCE: $(list_short "$keys")" persistence; }
+	if [ -n "$keys" ]; then
+		any=1
+		local summary="" k
+		for k in $keys; do
+			# "256 SHA256:abc… comment (ED25519)" → "comment ED25519 SHA256:abc…"
+			have ssh-keygen && summary="$summary $(ssh-keygen -lf "$k" 2>/dev/null | awk '{
+				c = ""; for (i = 3; i < NF; i++) c = c (c == "" ? "" : " ") $i
+				if (c == "no comment") c = "(no comment)"
+				t = $NF; gsub(/[()]/, "", t)
+				printf "%s%s %s %s", (n++ ? ", " : ""), c, t, substr($2, 1, 15) "…"
+			}')"
+		done
+		add MED CHECK "SSH keys changed" "since $SINCE: $(list_short "$keys") —${summary:- review}; confirm every key is yours" persistence
+	fi
 	sudo=$(find /etc/sudoers /etc/sudoers.d -newermt "$SINCE" -type f 2>/dev/null)
 	[ -n "$sudo" ] && { any=1; add MED CHECK "sudoers changed" "since $SINCE: $(list_short "$(oneline "$sudo")")" persistence; }
 	for f in $(find /tmp /var/tmp /dev/shm -xdev -maxdepth 3 -type f 2>/dev/null | head -n 500); do
@@ -1323,7 +1425,7 @@ EOF
 check_wp_users_containers() {
 	[ "$OPT_DEEP" = 1 ] && [ -n "$CTR" ] || return 0
 	local name lbl image roots r admins
-	while IFS="$(printf '\t')" read -r name lbl image; do
+	while IFS='|' read -r name lbl image _ _ _; do
 		[ -n "$name" ] || continue
 		# shellcheck disable=SC2016 # expanded by the container's shell
 		roots=$(timeout 30 "$CTR" exec "$name" sh -c 'for d in /var/www /app /config/www; do [ -d "$d" ] && find "$d" -maxdepth 4 -name wp-load.php 2>/dev/null; done' 2>/dev/null)
@@ -1338,11 +1440,16 @@ EOF
 }
 
 check_exposure() {
-	local p pub=""
+	local p sc all="" pub="" lan=""
 	for p in 80 443 8080 8443 8006 32400 9000; do
-		public_port "$p" && pub="$pub $p"
+		sc=$(listen_scope "$p")
+		case $sc in all) all="$all $p" ;; public) pub="$pub $p" ;; private) lan="$lan $p" ;; esac
 	done
-	[ -n "$pub" ] && add INFO OK "Exposure" "listening on non-loopback addresses (ports):$pub"
+	sc=""
+	[ -n "$all" ] && sc="all interfaces:$all"
+	[ -n "$pub" ] && sc="${sc:+$sc; }public IP:$pub"
+	[ -n "$lan" ] && sc="${sc:+$sc; }LAN/VPN only:$lan"
+	[ -n "$sc" ] && add INFO OK "Exposure" "listening ports — $sc (port forwarding/firewall decide internet reach)"
 	return 0
 }
 
@@ -1384,8 +1491,12 @@ rem_body() {
 	case $1 in
 	php)
 		case $(rem_scope php) in *host*)
-			printf '%s\n' "Host: sudo apt update && sudo apt install --only-upgrade \$(dpkg-query -W -f='\${Package}\\n' 'php*' 'libapache2-mod-php*' | grep -E '^(php|libapache2)')"
-			echo "      then restart every PHP process: sudo systemctl restart 'php*-fpm' apache2   (whichever you run)"
+			if [ "$IS_UNRAID" = 1 ]; then
+				unraid_hint "PHP 8.4.27+"
+			else
+				printf '%s\n' "Host: sudo apt update && sudo apt install --only-upgrade \$(dpkg-query -W -f='\${Package}\\n' 'php*' 'libapache2-mod-php*' | grep -E '^(php|libapache2)')"
+				echo "      then restart every PHP process: sudo systemctl restart 'php*-fpm' apache2   (whichever you run)"
+			fi
 			;;
 		esac
 		case $(rem_scope php) in *container*)
@@ -1406,8 +1517,11 @@ Ref: https://ubuntu.com/security/CVE-2026-109618
 EOF
 	;;
 	php_restart) echo "sudo systemctl restart 'php*-fpm' apache2   # whichever is in use; needrestart -r l lists all" ;;
-	nginx) cat <<'EOF'
-sudo apt update && sudo apt install --only-upgrade nginx 'nginx-*' && sudo nginx -t && sudo systemctl restart nginx
+	nginx)
+		case $(rem_scope nginx) in *host*) [ "$IS_UNRAID" = 1 ] && unraid_hint "nginx 1.30.6+" ;; esac
+		case $(rem_scope nginx) in *container*) echo "Containers: rebuild on nginx 1.30.6+ / 1.31.7+ (e.g. nginx:1.30-alpine; the 1.28 branch gets no fix)."; ctr_redeploy_hint "nginx -v" ;; esac
+		cat <<'EOF'
+Debian/Ubuntu host: sudo apt update && sudo apt install --only-upgrade nginx 'nginx-*' && sudo nginx -t && sudo systemctl restart nginx
 nginx.org repo: upgrade to 1.30.6+ (stable) or 1.31.7+ (mainline). Containers: rebuild on nginx 1.30.6+ / 1.31.7+.
 Distro builds without a backport yet — reduce exposure until one ships:
   • avoid `alias` combined with `rewrite` or $request_filename (CVE-2026-15176)
@@ -1437,7 +1551,10 @@ EOF
 	;;
 	kernel)
 		echo "Patch the HOST kernel and reboot — updating guests does not help."
-		if [ "$IS_PVE" = 1 ]; then
+		if [ "$IS_UNRAID" = 1 ]; then
+			echo "Unraid: update the OS (Tools → Update OS) to a release with kernel 6.18.57+ (or a stated PwnEscape backport), then reboot."
+			echo "Until then run only trusted VMs on this host."
+		elif [ "$IS_PVE" = 1 ]; then
 			echo "apt update && apt full-upgrade → proxmox-kernel-$PVE_KERNEL_FIXED-pve or newer → migrate/stop VMs → reboot."
 			echo "Older kernel series (e.g. 6.8 on Proxmox VE 8) get no fix: upgrade to a release with the 7.0 kernel series."
 		elif [ "$OS_ID" = debian ]; then
@@ -1562,6 +1679,12 @@ EOF
 	;;
 	containers) echo "Check those images' PHP / NGINX / Plex versions against the fixed versions above, e.g. docker image inspect." ;;
 	esac
+}
+
+# unraid_hint WHAT: host components on Unraid come from the OS image, not packages
+unraid_hint() {
+	echo "Unraid host (web UI): update Unraid OS (Tools → Update OS) once a release ships $1."
+	echo "  Until then keep the web UI off the internet: no port forwarding to 80/443, reach it over LAN/VPN only."
 }
 
 # rem_scope KEY → "host", "container" or "host container": where KEY's open findings are
@@ -1763,6 +1886,6 @@ main() {
 	exit_code
 }
 
-if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then  # also true when piped: curl … | sudo bash
 	main "$@"
 fi

@@ -245,10 +245,98 @@ C /etc
 A /etc/cron.d/sync
 A /usr/local/bin/kworkerd
 C /etc/passwd
+A /root/.ssh/authorized_keys
 A /tmp/sess_abc"
-[ "${F_STAT[0]}" = IOC ] && ok || bad "cron drop should be IOC"
-case "${F_DETAIL[1]}" in *kworkerd*passwd*|*passwd*kworkerd*) ok ;; *) bad "drift check rows: ${F_DETAIL[*]}" ;; esac
+[ "${F_COMP[0]}/${F_STAT[0]}" = "Container persistence/IOC" ] && ok || bad "ssh key drop should be IOC: ${F_COMP[*]}"
+[ "${F_COMP[1]}/${F_STAT[1]}" = "Cron changed after start/CHECK" ] && ok || bad "cron without content evidence is CHECK"
+case "${F_DETAIL[2]}" in *kworkerd*passwd*|*passwd*kworkerd*) ok ;; *) bad "drift check rows: ${F_DETAIL[*]}" ;; esac
 case "${F_DETAIL[*]}" in *sess_abc*|*apache2*) bad "tmp/run noise should be ignored" ;; *) ok ;; esac
+
+# With a container: stub the exec helpers (jupiter: linuxserver crontab + PBS runit link at startup)
+STARTED=1760950748
+ctr_stat() { while read -r p; do case $p in
+	/etc/crontabs/root|/etc/crontabs/abc) echo "$((STARTED + 1)) $p" ;;
+	/etc/cron.daily/proxmox-daily-update) echo "$STARTED $p" ;;
+	/etc/cron.d/late) echo "$((STARTED + 7200)) $p" ;;
+	/etc/cron.d/late-clean) echo "$((STARTED + 7200)) $p" ;;
+	/usr/local/bin/old) echo "$((STARTED - 86400)) $p" ;;
+	esac; done; }
+ctr_cat() { case $2 in /etc/cron.d/late) echo '* * * * * root /tmp/.x/run >/dev/null' ;; *) echo '0 2 * * * root run-parts /etc/periodic/daily' ;; esac; }
+reset
+eval_drift "service freshrss" "C /etc/crontabs
+C /etc/crontabs/abc
+C /etc/crontabs/root
+A /etc/cron.daily/proxmox-daily-update" freshrss "$STARTED"
+[ ${#F_STAT[@]} = 0 ] && ok || bad "startup-window changes should be ignored: ${F_COMP[*]}"
+reset
+eval_drift "service x" "A /etc/cron.d/late
+A /etc/cron.d/late-clean
+A /usr/local/bin/old
+C /etc/crontabs/root" x "$STARTED"
+[ "${F_STAT[0]}" = IOC ] && case "${F_DETAIL[0]}" in *"/etc/cron.d/late"*) true ;; *) false ;; esac && ok || bad "late cron running from /tmp → IOC: ${F_DETAIL[*]}"
+case "${F_DETAIL[1]}" in *late-clean*) ok ;; *) bad "late clean cron → CHECK: ${F_DETAIL[*]}" ;; esac
+case "${F_DETAIL[2]}" in *"/usr/local/bin/old"*) ok ;; *) bad "change from before this start is kept: ${F_DETAIL[*]}" ;; esac
+case "${F_DETAIL[*]}" in *crontabs/root*) bad "startup crontab should be dropped" ;; *) ok ;; esac
+ctr_stat() { cat >/dev/null; }   # container without stat: nothing is dropped
+reset; eval_drift "service y" "A /etc/cron.d/z" y "$STARTED"
+[ "${F_COMP[0]}" = "Cron changed after start" ] && ok || bad "no stat → keep findings"
+# first start (creation) window: DOCKER_MODS / PUID changes right after create are dropped
+CREATED=$((STARTED - 86400))
+ctr_stat() { while read -r p; do case $p in
+	/usr/bin/perlbug) echo "$((CREATED + 11)) $p" ;;
+	/etc/passwd) echo "$((CREATED + 3600)) $p" ;;
+	esac; done; }
+ctr_cat() { printf 'root:x:0:0::/root:/bin/sh\npaperless:x:99:100::/usr/src/paperless:/bin/sh\n'; }
+reset; eval_drift "container plex" "A /usr/bin/perlbug
+C /etc/passwd
+C /etc/passwd-
+C /etc/shadow" plex "$STARTED" "" "$CREATED"
+[ ${#F_STAT[@]} = 0 ] && ok || bad "creation-window + benign passwd change should be clean: ${F_DETAIL[*]}"
+ctr_cat() { printf 'root:x:0:0::/root:/bin/sh\ntoor:x:0:0::/root:/bin/sh\n'; }
+reset; eval_drift "container x" "C /etc/passwd" x "$STARTED" "" "$CREATED"
+case "${F_STAT[0]}:${F_DETAIL[0]}" in IOC:*"extra root: toor"*) ok ;; *) bad "extra UID 0 → IOC: ${F_DETAIL[*]}" ;; esac
+unset -f ctr_stat ctr_cat; . ./oct2026-scan.sh   # restore real helpers
+OCT_SCAN_VCMP=${OCT_SCAN_VCMP:-}
+
+# mount points, docker-init and bytecode caches are not attacker changes
+reset
+eval_drift "container immich" "A /usr/src/app
+A /usr/src/app/upload
+A /sbin/docker-init
+A /opt/flaresolverr/src/__pycache__
+A /opt/flaresolverr/src/__pycache__/x.cpython-313.pyc
+A /usr/local/bin/real" "" 0 "/usr/src/app/upload /config"
+[ "${#F_STAT[@]}" = 1 ] && case "${F_DETAIL[0]}" in *"/usr/local/bin/real") true ;; *) false ;; esac && ok || bad "noise filtering: ${F_DETAIL[*]}"
+
+# --- container listing parse: empty service-name field must not shift columns ---
+IFS='|' read -r n i s st m <<EOF
+/freshrss|lscr.io/linuxserver/freshrss||2026-10-20T07:59:08.04Z|/mnt/user/appdata/freshrss>/config;
+EOF
+[ "$n#$i#$s#$m" = "/freshrss#lscr.io/linuxserver/freshrss##/mnt/user/appdata/freshrss>/config;" ] && ok || bad "inspect parse: $n|$i|$s|$m"
+
+# --- listen scope ---
+LISTEN="127.0.0.1:80
+192.168.11.120:80
+192.168.11.120:443
+0.0.0.0:32400
+[::]:8443
+203.0.113.5:8080
+100.101.102.103:9000"
+[ "$(listen_scope 80)" = private ] && ok || bad "LAN-only 80: $(listen_scope 80)"
+[ "$(listen_scope 32400)" = all ] && ok || bad "all 32400"
+[ "$(listen_scope 8443)" = all ] && ok || bad "[::] is all"
+[ "$(listen_scope 8080)" = public ] && ok || bad "public IP"
+[ "$(listen_scope 9000)" = private ] && ok || bad "tailscale CGNAT is private"
+[ -z "$(listen_scope 22)" ] && ok || bad "not listening"
+reset; LISTEN="192.168.1.5:32400"; eval_plex t 1.42.0.1-a
+case $(last_detail) in *"assume compromise"*) bad "LAN-only Plex should not say assume compromise" ;; *) ok ;; esac
+LISTEN=""
+
+# --- Unraid remediation ---
+reset; IS_UNRAID=1; add CRIT VULNERABLE "PHP 8.4.26" "host /usr/bin/php (not from a package): 8.4.26 < 8.4.27" php
+out=$(rem_body php); IS_UNRAID=0
+case $out in *"Update OS"*) ok ;; *) bad "Unraid php hint" ;; esac
+case $out in *"apt install"*) bad "no apt on Unraid" ;; *) ok ;; esac
 
 # --- shells under web workers ---
 reset
