@@ -309,7 +309,7 @@ A /usr/local/bin/real" "" 0 "/usr/src/app/upload /config"
 [ "${#F_STAT[@]}" = 1 ] && case "${F_DETAIL[0]}" in *"/usr/local/bin/real") true ;; *) false ;; esac && ok || bad "noise filtering: ${F_DETAIL[*]}"
 
 # --- container listing parse: empty service-name field must not shift columns ---
-IFS='|' read -r n i s st m <<EOF
+IFS='|' read -r n i s _ m <<EOF
 /freshrss|lscr.io/linuxserver/freshrss||2026-10-20T07:59:08.04Z|/mnt/user/appdata/freshrss>/config;
 EOF
 [ "$n#$i#$s#$m" = "/freshrss#lscr.io/linuxserver/freshrss##/mnt/user/appdata/freshrss>/config;" ] && ok || bad "inspect parse: $n|$i|$s|$m"
