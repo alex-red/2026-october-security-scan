@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck oct2026-scan.sh tests/run.sh
+      - name: unit tests (dpkg comparisons)
+        run: bash tests/run.sh
+      - name: unit tests (awk comparisons)
+        run: OCT_SCAN_VCMP=awk bash tests/run.sh
+
+  smoke:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:22.04", "ubuntu:24.04", "debian:12", "debian:13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: run scanner in ${{ matrix.image }}
+        run: |
+          docker run --rm -v "$PWD:/w:ro" "${{ matrix.image }}" bash -c '
+            apt-get update -qq >/dev/null && apt-get install -y -qq iproute2 procps >/dev/null
+            bash /w/oct2026-scan.sh --no-docker --no-color; rc=$?
+            echo "exit code: $rc"; [ "$rc" -le 2 ] || exit 1
+            bash /w/oct2026-scan.sh --no-docker --json > /tmp/out.json; [ $? -le 2 ] || exit 1
+            grep -q "\"scanner\":\"oct2026-scan\"" /tmp/out.json'
