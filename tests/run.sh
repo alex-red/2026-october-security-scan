@@ -120,7 +120,7 @@ expect_stat "pve 7.0.14-25" OK eval_kernel 1 debian trixie 7.0.14-25-pve "" 1 ct
 expect_stat "pve 6.8 eol series" VULNERABLE eval_kernel 1 debian bookworm 6.8.12-1-pve "" 1 ctx
 [ "${F_SEV[0]}" = CRIT ] && ok || bad "kvm host should be CRIT"
 expect_stat "debian 13 old" VULNERABLE eval_kernel 0 debian trixie 6.12.0-1-amd64 "#1 SMP PREEMPT_DYNAMIC Debian 6.12.110-1 (2026-09-01)" 0 ctx
-[ "${F_SEV[0]}" = LOW ] && ok || bad "non-kvm should be LOW"
+[ "${F_SEV[0]}" = INFO ] && ok || bad "non-kvm should be INFO"
 expect_stat "debian 13 fixed" OK eval_kernel 0 debian trixie 6.12.0-1-amd64 "#1 SMP PREEMPT_DYNAMIC Debian 6.12.113-1 (2026-10-16)" 0 ctx
 expect_stat "debian 12 bpo" CHECK eval_kernel 0 debian bookworm 6.12.0-0.bpo-amd64 "#1 SMP Debian 6.12.48-1~bpo12+1 (2026-08-01)" 0 ctx
 expect_stat "ubuntu no fix" CHECK eval_kernel 0 ubuntu noble 6.8.0-80-generic "#80-Ubuntu SMP" 1 ctx
@@ -165,6 +165,11 @@ expect_exit() { local rc=0; exit_code || rc=$?; [ "$rc" = "$1" ] && ok || bad "e
 reset; add CRIT OK x y; expect_exit 0
 reset; add CRIT CHECK x y; expect_exit 1
 reset; add CRIT CHECK x y; add CRIT IOC x y; expect_exit 2
+# kernel flaw on a host without VMs is informational only
+reset; eval_kernel 0 ubuntu noble 6.8.0-80-generic "#80-Ubuntu SMP" 0 ctx; expect_exit 0
+reset; eval_kernel 0 debian trixie 6.12.0-1-amd64 "#1 SMP Debian 6.12.110-1 (2026-09-01)" 0 ctx; expect_exit 0
+reset; eval_kernel 0 ubuntu noble 6.8.0-80-generic "#80-Ubuntu SMP" 1 ctx; expect_exit 1
+reset; eval_kernel 1 debian bookworm 6.8.12-1-pve "" 1 ctx; expect_exit 2
 
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" = 0 ]

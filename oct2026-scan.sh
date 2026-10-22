@@ -13,7 +13,7 @@
 set -u
 set -o pipefail
 
-SCAN_VERSION="1.0.0"
+SCAN_VERSION="1.0.1"
 DATA_DATE="2026-10-22"
 
 # ---------------------------------------------------------------------------
@@ -86,6 +86,7 @@ Usage: sudo bash oct2026-scan.sh [options]
   -V, --version print version
 
 Exit codes: 0 nothing found, 1 needs review (CHECK), 2 vulnerable or indicator of compromise, 3 error
+(INFO rows, such as the kernel flaw on a host that runs no VMs, don't affect the exit code)
 Latest version: https://github.com/alex-red/2026-october-security-scan
 EOF
 }
@@ -433,7 +434,7 @@ eval_updraft() {
 
 # eval_kernel IS_PVE DISTRO CODENAME UNAME_R UNAME_V KVM_HOST(0/1) CONTEXT
 eval_kernel() {
-	local pve=$1 os=$2 cn=$3 rel=$4 uv=$5 kvm=$6 ctx=$7 sev=LOW base fx="" row ref
+	local pve=$1 os=$2 cn=$3 rel=$4 uv=$5 kvm=$6 ctx=$7 sev=INFO base fx="" row ref
 	[ "$kvm" = 1 ] && sev=CRIT
 	if [ "$pve" = 1 ] && [ "${rel%-pve}" != "$rel" ]; then
 		base=${rel%-pve}
@@ -805,7 +806,7 @@ check_containers() {
 	done <<EOF
 $("$CTR" ps --format '{{.Names}}\t{{.Image}}' 2>/dev/null)
 EOF
-	[ -n "$noshell" ] && add INFO CHECK "Containers without shell" "could not inspect:$noshell — check their image versions manually" containers
+	[ -n "$noshell" ] && add MED CHECK "Containers without shell" "could not inspect:$noshell — check their image versions manually" containers
 	add INFO OK "Containers" "$n running container(s) inspected via $CTR exec"
 }
 
@@ -1129,9 +1130,11 @@ render_json() {
 	printf '}}\n'
 }
 
+# INFO findings (e.g. the kernel flaw on a host without VMs) never change the exit code
 exit_code() {
 	local i code=0
 	for ((i = 0; i < ${#F_STAT[@]}; i++)); do
+		[ "${F_SEV[$i]}" = INFO ] && continue
 		case ${F_STAT[$i]} in
 		IOC | VULNERABLE) code=2 ;;
 		CHECK) [ "$code" -lt 1 ] && code=1 ;;

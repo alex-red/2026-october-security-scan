@@ -48,6 +48,8 @@ It also runs:
 
 **Exit codes:** `0` nothing found · `1` something needs review · `2` vulnerable or indicator of compromise · `3` error. Use them from cron, Ansible and similar tools.
 
+Rows with severity `INFO` never change the exit code. The main case is the PwnEscape kernel flaw on a host that runs no VMs: it needs a malicious VM guest, so there it's reported for information only. Otherwise every Ubuntu server would exit `1` until Ubuntu ships a fixed kernel.
+
 ## Reading the output
 
 ```
