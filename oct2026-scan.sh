@@ -13,7 +13,7 @@
 set -u
 set -o pipefail
 
-SCAN_VERSION="1.1.0"
+SCAN_VERSION="1.1.1"
 DATA_DATE="2026-10-22"
 
 # ---------------------------------------------------------------------------
@@ -84,7 +84,7 @@ CPU_OK_RE='^(kvm|qemu-system|ffmpeg|Plex Transcoder|HandBrakeCLI|mysqld|mariadbd
 # auto_prepend_file values used by legitimate security plugins
 PREPEND_OK_RE='wordfence-waf\.php|ninjafirewall|malcare|sucuri|bbq-firewall'
 # Remediation keys that describe evidence of exploitation (vs. a missing patch)
-COMPROMISE_REMS=" ioc webshell wp_ioc persistence attempts crash drift cpu plex_ioc nextcloud_ioc "
+COMPROMISE_REMS=" ioc webshell wp_ioc persistence attempts probes crash drift cpu plex_ioc nextcloud_ioc "
 
 # ---------------------------------------------------------------------------
 # Options
@@ -1034,33 +1034,74 @@ EOF
 	return 0
 }
 
-# log_counts < LOG-LINES → "mem crash up200 up inject<TAB>crash-sample<TAB>uploads-sample"
+# log_counts < LOG-LINES → key=value summary of exploit traces.
+# Request stats use access-log lines only (error-log lines for the same request are not
+# double-counted). The status is the field right after the quoted request line, which works
+# for the standard combined format and for formats with extra columns (e.g. CapRover).
 log_counts() {
 	awk '
-	/Allowed memory size of [0-9]+ bytes exhausted/ { m++ }
-	/exit signal Segmentation fault|exited on signal (6|11)|SIGSEGV|segfault at/ { c++; if (cs == "") cs = substr($0, 1, 120) }
-	/\/wp-content\/uploads\/[^ "?]*\.(php[0-9]?|phtml|phar)/ {
-		if ($0 ~ /\/wp-content\/uploads\/[^ "?]*\.(php[0-9]?|phtml|phar)[^"]*" 200 /) { u2++; if (us == "") us = substr($0, 1, 120) } else u++
+	function req(line,   r, a) {
+		if (!match(line, /"[A-Z]+ [^"]* HTTP\/[0-9.]+" [0-9][0-9][0-9]/)) return 0
+		r = substr(line, RSTART + 1, RLENGTH - 1)
+		S = substr(r, length(r) - 2)
+		split(r, a, " "); M = a[1]; P = a[2]
+		return 1
 	}
-	{ l = tolower($0) }
-	l ~ /(\$\(|%24%28|\$\{ifs|%24%7bifs|\/bin\/(ba)?sh|(wget|curl)(%20|\+)http|base64_decode|php:\/\/input|allow_url_include|auto_prepend_file)/ { i++ }
-	END { printf "%d %d %d %d %d\t%s\t%s\n", m, c, u2, u, i, cs, us }'
+	function short(s) { return substr(s, 1, 120) }
+	/Allowed memory size of [0-9]+ bytes exhausted/ { m++ }
+	/exit signal Segmentation fault|exited on signal (6|11)|SIGSEGV|segfault at/ { c++; if (cs == "") cs = short($0) }
+	{
+		if (!req($0)) next
+		ip = $1; path = P; sub(/\?.*/, "", path); lp = tolower(P)
+		if (path ~ /\/wp-content\/uploads\/.*\.(php[0-9]?|phtml|phar)$/) {
+			if (S ~ /^2/) { u2++; if (us == "") us = short($0) } else u++
+		}
+		if (lp ~ /(\$\(|%24%28|\$\{ifs|%24%7bifs|\/bin\/(ba)?sh|(wget|curl)(%20|\+)http|base64_decode|php:\/\/input|allow_url_include|auto_prepend_file)/) {
+			i++; IPS[ip] = 1; CODE[S]++
+			if (S ~ /^[34]/) f++
+			else if (S ~ /^2/ && M == "GET" && (path == "/" || path == "/index.php")) h++
+			else { r2++; if (rs == "") rs = M " " substr(path, 1, 60) " → " S }
+		}
+		if (M == "POST" && S ~ /^2/ && path ~ /\.php$/ && path !~ /(wp-login|xmlrpc|wp-cron)\.php$/) {
+			PP[ip]++; if (!(ip in PS)) PS[ip] = path
+		}
+	}
+	END {
+		for (x in IPS) { k++; if (x in PP) { fo += PP[x]; if (fs == "") fs = x " POST " substr(PS[x], 1, 60) } }
+		for (s in CODE) codes = codes (codes == "" ? "" : " ") CODE[s] "×" s
+		printf "mem=%d\ncrash=%d\nup200=%d\nup=%d\ninj=%d\ninj_ips=%d\ninj_failed=%d\ninj_home=%d\ninj_reached=%d\nfollow=%d\n", m, c, u2, u, i, k, f, h, r2, fo
+		printf "codes=%s\ncrash_s=%s\nup_s=%s\nreach_s=%s\nfollow_s=%s\n", codes, cs, us, rs, fs
+	}'
 }
 
-# eval_log_counts LABEL "COUNTS<TAB>CRASH-SAMPLE<TAB>UPLOAD-SAMPLE"
+# eval_log_counts LABEL LOG_COUNTS-OUTPUT
 eval_log_counts() {
-	local lbl=$1 nums cs us m c u2 u i
-	nums=$(printf '%s' "$2" | cut -f1)
-	cs=$(printf '%s' "$2" | cut -f2)
-	us=$(printf '%s' "$2" | cut -f3)
-	read -r m c u2 u i <<EOF
-$nums
+	local lbl=$1 line k v mem=0 crash=0 up200=0 up=0 inj=0 ips=0 failed=0 home=0 reached=0 follow=0
+	local codes="" crash_s="" up_s="" reach_s="" follow_s="" sum
+	while IFS= read -r line; do
+		k=${line%%=*} v=${line#*=}
+		case $k in
+		mem) mem=$v ;; crash) crash=$v ;; up200) up200=$v ;; up) up=$v ;; inj) inj=$v ;; inj_ips) ips=$v ;;
+		inj_failed) failed=$v ;; inj_home) home=$v ;; inj_reached) reached=$v ;; follow) follow=$v ;;
+		codes) codes=$v ;; crash_s) crash_s=$v ;; up_s) up_s=$v ;; reach_s) reach_s=$v ;; follow_s) follow_s=$v ;;
+		esac
+	done <<EOF
+$2
 EOF
-	[ "${u2:-0}" -gt 0 ] && add CRIT IOC "PHP executed from uploads" "$lbl: $u2 successful request(s), e.g. $us" webshell
-	[ "${c:-0}" -gt 0 ] && add HIGH CHECK "Web worker crashes" "$lbl: $c segfault/abort(s) since $SINCE, e.g. $cs" crash
-	[ "${m:-0}" -gt 0 ] && add MED CHECK "PHP memory-limit fatals" "$lbl: $m since $SINCE (the PHP2Shell trigger condition)" attempts
-	[ "${u:-0}" -gt 0 ] && add INFO CHECK "Probes for PHP in uploads" "$lbl: $u failed request(s) since $SINCE" attempts
-	[ "${i:-0}" -gt 0 ] && add INFO CHECK "Injection probes" "$lbl: $i request(s) with shell/PHP injection payloads since $SINCE" attempts
+	[ "$up200" -gt 0 ] && add CRIT IOC "PHP executed from uploads" "$lbl: $up200 successful request(s), e.g. $up_s" webshell
+	[ "$crash" -gt 0 ] && add HIGH CHECK "Web worker crashes" "$lbl: $crash segfault/abort(s) since $SINCE, e.g. $crash_s" crash
+	[ "$mem" -gt 0 ] && add MED CHECK "PHP memory-limit fatals" "$lbl: $mem since $SINCE (the PHP2Shell trigger condition)" attempts
+	[ "$up" -gt 0 ] && add INFO OK "Probes for PHP in uploads" "$lbl: $up request(s) since $SINCE, all failed"
+	if [ "$inj" -gt 0 ]; then
+		sum="$inj probe(s) from $ips IP(s) since $SINCE: $codes"
+		if [ "$reached" -gt 0 ]; then
+			add MED CHECK "Injection probes reached app" "$lbl: $sum — $reached not rejected, e.g. $reach_s" probes
+		else
+			[ "$home" -gt 0 ] && sum="$sum; $home only loaded the homepage"
+			add INFO OK "Injection probes failed" "$lbl: $sum — all rejected or redirected"
+		fi
+	fi
+	[ "$follow" -gt 0 ] && add HIGH CHECK "Probing IP followed up" "$lbl: $follow successful POST(s) to PHP from IPs that sent injection probes, e.g. $follow_s" probes
 	return 0
 }
 
@@ -1329,7 +1370,8 @@ rem_title() {
 	webshell) echo "Webshell / backdoor in a web root" ;;
 	wp_ioc) echo "WordPress changes to verify" ;;
 	persistence) echo "Persistence mechanisms" ;;
-	attempts) echo "Exploit attempts in logs" ;;
+	attempts) echo "PHP2Shell trigger condition in logs" ;;
+	probes) echo "Injection probes that need a closer look" ;;
 	crash) echo "Web worker crashes (possible memory-corruption exploitation)" ;;
 	drift) echo "Container filesystem changed since start" ;;
 	cpu) echo "Possible cryptominer" ;;
@@ -1484,10 +1526,19 @@ Review: crontab -l -u <user> ; systemctl cat <unit> ; ls -la ~/.ssh ; cat /etc/l
 EOF
 	;;
 	attempts) cat <<'EOF'
-Probes are normal internet noise; they matter when they hit a version that was vulnerable at the time.
 Memory-limit fatals are PHP2Shell's trigger condition: compare their timestamps with POST requests to PHP endpoints
 in the access log, and if PHP was unpatched at that time, look for new PHP files and admins (re-run with --deep).
-  docker logs --since <date> <container> 2>&1 | grep -E 'Allowed memory size|uploads/.*\.php'
+  docker logs --since <date> <container> 2>&1 | command grep -E 'Allowed memory size'
+EOF
+	;;
+	probes) cat <<'EOF'
+Some injection probes were not rejected (2xx on a page other than the homepage, or a 5xx), or a probing IP later
+made successful POSTs to PHP files. List what each probing IP requested, with status codes:
+  docker logs --since <date> <container> 2>&1 | command grep -F '<ip> ' | command grep -oE '"[A-Z]+ [^"]*" [0-9]{3}' | sort | uniq -c
+  (host: command grep -hF '<ip> ' /var/log/nginx/*access*.log /var/log/apache2/*access*.log | ...)
+Benign: the app returned its normal page or an error page (similar byte count to ordinary requests).
+Suspicious: a response much larger than usual (command output), or the IP later POSTing to a PHP file that isn't
+part of your site. Then check the "Signs of exploitation" rows and decode the payload for files/hosts to search for.
 EOF
 	;;
 	crash) cat <<'EOF'

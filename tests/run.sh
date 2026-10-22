@@ -198,17 +198,43 @@ recent=/srv|3" ""
 [ "${F_SEV[0]}" = INFO ] && ok || bad "plugin updates on non-updraft site are INFO"
 
 # --- log scanning ---
-reset
-c=$(printf '%s\n' \
- '1.2.3.4 - - [21/Oct/2026:07:43:00 +0000] "GET /wp-content/uploads/2026/10/x.php?c=id HTTP/1.1" 200 12 "-" "curl"' \
- '1.2.3.4 - - [21/Oct/2026:07:44:00 +0000] "GET /wp-content/uploads/shell.php HTTP/1.1" 404 12 "-" "curl"' \
- '5.6.7.8 - - [21/Oct/2026:08:00:00 +0000] "GET /?x=%24%28id%29 HTTP/1.1" 200 1 "-" "x"' \
- 'PHP Fatal error:  Allowed memory size of 134217728 bytes exhausted (tried to allocate 20480 bytes)' \
- '[Tue Oct 21 07:43:01 2026] [core:notice] AH00052: child pid 31 exit signal Segmentation fault (11)' | log_counts)
-[ "$(printf '%s' "$c" | cut -f1)" = "1 1 1 1 1" ] && ok || bad "log_counts: $c"
-eval_log_counts "service wp" "$c"
-case "${F_STAT[*]}" in *IOC*) ok ;; *) bad "uploads php 200 should be IOC" ;; esac
-[ ${#F_STAT[@]} = 5 ] && ok || bad "eval_log_counts rows: ${#F_STAT[@]}"
+lc_get() { printf '%s\n' "$1" | sed -n "s/^$2=//p"; }
+# CapRover-style lines (extra column before the request) plus the matching error-log line
+L_FAIL='50.114.236.142 - - [22/Oct/2026:03:12:01 +0000] example.com "POST /?%ADd+allow_url_include%3d1+%ADd+auto_prepend_file%3dphp://input HTTP/1.1" 404 153 "-" "Mozilla"
+50.114.236.142 - - [22/Oct/2026:03:12:02 +0000] example.com "POST /index.php?%ADd+allow_url_include%3d1 HTTP/1.1" 400 157 "-" "Mozilla"
+2026/10/22 03:12:01 [error] 30#30: *1 open() "/usr/share/nginx/default/index.php" failed (2: No such file or directory), client: 50.114.236.142, server: _, request: "POST /index.php?%ADd+allow_url_include%3d1 HTTP/1.1", host: "1.2.3.4"
+9.9.9.9 - - [22/Oct/2026:04:00:00 +0000] "GET /?q=%24%28id%29 HTTP/1.1" 200 51234 "-" "x"
+9.9.9.9 - - [22/Oct/2026:04:00:01 +0000] "POST /wp-login.php HTTP/1.1" 200 4100 "-" "x"'
+c=$(printf '%s\n' "$L_FAIL" | log_counts)
+[ "$(lc_get "$c" inj)" = 3 ] && ok || bad "inj count (error-log line must not count): $(lc_get "$c" inj)"
+[ "$(lc_get "$c" inj_failed)" = 2 ] && ok || bad "inj_failed"
+[ "$(lc_get "$c" inj_home)" = 1 ] && ok || bad "inj_home"
+[ "$(lc_get "$c" inj_reached)" = 0 ] && ok || bad "inj_reached"
+[ "$(lc_get "$c" inj_ips)" = 2 ] && ok || bad "inj_ips"
+[ "$(lc_get "$c" follow)" = 0 ] && ok || bad "wp-login POST is not a follow-up"
+reset; eval_log_counts "service captain-nginx" "$c"
+[ "${F_COMP[0]}" = "Injection probes failed" ] && [ "${F_STAT[0]}" = OK ] && ok || bad "failed probes row: ${F_COMP[*]}"
+[ "$(verdict)" = clean ] && ok || bad "failed probes keep verdict clean"
+
+L_REACH='7.7.7.7 - - [22/Oct/2026:05:00:00 +0000] "GET /cgi-bin/luci?cmd=%24%28id%29 HTTP/1.1" 200 812 "-" "x"
+7.7.7.7 - - [22/Oct/2026:05:01:00 +0000] "POST /wp-content/themes/t/inc/x.php HTTP/1.1" 200 33 "-" "x"
+8.8.8.8 - - [22/Oct/2026:05:02:00 +0000] "GET /x?a=${IFS} HTTP/1.1" 502 0 "-" "x"'
+c=$(printf '%s\n' "$L_REACH" | log_counts)
+[ "$(lc_get "$c" inj_reached)" = 2 ] && ok || bad "2xx off-homepage and 5xx count as reached"
+[ "$(lc_get "$c" follow)" = 1 ] && ok || bad "follow-up POST from probing IP"
+case $(lc_get "$c" follow_s) in "7.7.7.7 POST /wp-content/themes/t/inc/x.php") ok ;; *) bad "follow_s: $(lc_get "$c" follow_s)" ;; esac
+reset; eval_log_counts "service wp" "$c"
+case "${F_COMP[*]}" in *"Injection probes reached app"*"Probing IP followed up"*) ok ;; *) bad "reach/follow rows: ${F_COMP[*]}" ;; esac
+[ "$(verdict)" = review ] && ok || bad "reached probes → review"
+
+L_IOC='1.2.3.4 - - [21/Oct/2026:07:43:00 +0000] "GET /wp-content/uploads/2026/10/x.php?c=id HTTP/1.1" 200 12 "-" "curl"
+1.2.3.4 - - [21/Oct/2026:07:44:00 +0000] "GET /wp-content/uploads/shell.php HTTP/1.1" 404 12 "-" "curl"
+PHP Fatal error:  Allowed memory size of 134217728 bytes exhausted (tried to allocate 20480 bytes)
+[Tue Oct 21 07:43:01 2026] [core:notice] AH00052: child pid 31 exit signal Segmentation fault (11)'
+c=$(printf '%s\n' "$L_IOC" | log_counts)
+[ "$(lc_get "$c" up200)/$(lc_get "$c" up)/$(lc_get "$c" mem)/$(lc_get "$c" crash)" = "1/1/1/1" ] && ok || bad "uploads/mem/crash counts"
+reset; eval_log_counts "service wp" "$c"
+[ "$(verdict)" = compromised ] && ok || bad "uploads php 200 → compromised"
 reset; eval_log_counts x "$(printf '' | log_counts)"; [ ${#F_STAT[@]} = 0 ] && ok || bad "empty logs → no rows"
 
 # --- container drift ---

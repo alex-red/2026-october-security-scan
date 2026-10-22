@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.1 — 2026-10-22
+
+- Injection probes are classified by response: "failed" (all 4xx/3xx, or only the homepage) or "reached app"
+  (2xx elsewhere, or 5xx — needs a closer look), with a status-code breakdown and IP count. IPs that sent probes
+  and also made successful POSTs to PHP files are flagged.
+- Log statistics use access-log lines only, so a request also logged in the error log is no longer counted twice.
+- Status codes are read right after the request line, so logs with extra columns (e.g. CapRover) parse correctly.
+- Remediation commands use `command grep` so they work when `grep` is aliased (e.g. to ripgrep).
+
 ## 1.1.0 — 2026-10-22
 
 - New "Signs of exploitation" section with a one-line verdict: webshells and PHP in upload folders,
