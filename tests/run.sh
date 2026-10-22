@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Unit tests for oct2026-scan.sh evaluators. No dependencies: bash tests/run.sh
-# `cond && ok || bad` is intentional throughout: ok never fails.
-# shellcheck disable=SC2015
+# `cond && ok || bad` is intentional throughout: ok never fails; PHP fixtures are literal.
+# shellcheck disable=SC2015,SC2016
 set -u
 cd "$(dirname "$0")/.." || exit 1
 # shellcheck source=oct2026-scan.sh

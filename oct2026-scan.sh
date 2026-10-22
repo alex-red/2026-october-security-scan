@@ -58,7 +58,6 @@ CURL_AFFECTED_FROM="8.12.0"
 CURL_FIXED="8.23.0"
 # Attack window starts used for "changed since" audits
 UPDRAFT_INCIDENT_START="2026-10-17"
-PHP2SHELL_DISCLOSED="2026-10-21"
 # Published indicators: Plex2Shell (miner/proxy payloads) and Nextcloud CODE attacks
 IOC_IPS="217.60.194.116 91.92.40.202 176.65.139.228 45.194.92.222 139.28.18.122 89.38.98.50"
 IOC_PROC_RE='xmrig|--donate-level|--rig-id|myawesomeproxy|mylovelyminer|proxystream|(^|[/ ])x12345( |$)'
@@ -69,6 +68,7 @@ IOC_PROC_RE='xmrig|--donate-level|--rig-id|myawesomeproxy|mylovelyminer|proxystr
 # Plex2Shell PoC 10-16, UpdraftCentral 10-17, PHP2Shell attempts 10-17/10-21.
 IOC_SINCE_DEFAULT="2026-10-01"
 # Webshell code patterns (POSIX ERE; also used by busybox grep inside containers)
+# shellcheck disable=SC2016 # literal PHP code, not shell expansions
 WEBSHELL_RE='eval[[:space:]]*\([[:space:]]*(base64_decode|gzinflate|gzuncompress|str_rot13|rawurldecode|\$_(POST|GET|REQUEST|COOKIE|SERVER))|(assert|system|exec|shell_exec|passthru|popen|proc_open|pcntl_exec)[[:space:]]*\([[:space:]]*\$_(POST|GET|REQUEST|COOKIE)|\$_(POST|GET|REQUEST|COOKIE)[[:space:]]*\[[^]]*\][[:space:]]*\(|create_function[[:space:]]*\([^)]*\$_(POST|GET|REQUEST|COOKIE)|FilesMan|b374k|r57shell|c99shell|IndoXploit|ALFA_DATA|WSOsetcookie'
 # Download-and-execute / reverse-shell patterns in cron jobs and unit files
 DL_EXEC_RE='(curl|wget)[^|;]*\|[[:space:]]*(ba|da)?sh|base64[[:space:]]+(-d|--decode)|/dev/tcp/|(nc|ncat|netcat)[[:space:]].*-e[[:space:]]|python[0-9.]*[[:space:]]+-c|(ba)?sh[[:space:]]+-i'
@@ -1213,7 +1213,7 @@ check_persistence() {
 	done
 	[ -n "$cronhits" ] && { any=1; add CRIT IOC "Suspicious cron jobs" "$(list_short "$cronhits")" persistence; }
 	for f in /etc/systemd/system/*.service /etc/systemd/system/*/*.service /root/.config/systemd/user/*.service /home/*/.config/systemd/user/*.service; do
-		[ -f "$f" ] && [ ! -L "$f" ] || continue
+		if [ ! -f "$f" ] || [ -L "$f" ]; then continue; fi
 		if grep -qE "^Exec[A-Za-z]*=.*(/tmp/|/dev/shm/|/var/tmp/)" "$f" 2>/dev/null || grep -qiE "$DL_EXEC_RE" "$f" 2>/dev/null; then
 			unitbad="$unitbad $f"
 		elif [ -n "$(find "$f" -newermt "$SINCE" 2>/dev/null)" ]; then
@@ -1284,6 +1284,7 @@ check_wp_users_containers() {
 	local name lbl image roots r admins
 	while IFS="$(printf '\t')" read -r name lbl image; do
 		[ -n "$name" ] || continue
+		# shellcheck disable=SC2016 # expanded by the container's shell
 		roots=$(timeout 30 "$CTR" exec "$name" sh -c 'for d in /var/www /app /config/www; do [ -d "$d" ] && find "$d" -maxdepth 4 -name wp-load.php 2>/dev/null; done' 2>/dev/null)
 		for r in $roots; do
 			admins=$(wp_users_php | timeout 30 "$CTR" exec -i -u www-data -w "${r%/wp-load.php}" "$name" php -- "$SINCE" 2>/dev/null)
@@ -1341,7 +1342,7 @@ rem_body() {
 	case $1 in
 	php)
 		case $(rem_scope php) in *host*)
-			echo "Host: sudo apt update && sudo apt install --only-upgrade \$(dpkg-query -W -f='\${Package}\\n' 'php*' 'libapache2-mod-php*' | grep -E '^(php|libapache2)')"
+			printf '%s\n' "Host: sudo apt update && sudo apt install --only-upgrade \$(dpkg-query -W -f='\${Package}\\n' 'php*' 'libapache2-mod-php*' | grep -E '^(php|libapache2)')"
 			echo "      then restart every PHP process: sudo systemctl restart 'php*-fpm' apache2   (whichever you run)"
 			;;
 		esac
@@ -1553,7 +1554,7 @@ sorted_indices() {
 verdict() {
 	local i v=clean
 	for ((i = 0; i < ${#F_STAT[@]}; i++)); do
-		[ "${F_KIND[$i]}" = ioc ] && [ "${F_SEV[$i]}" != INFO ] || continue
+		if [ "${F_KIND[$i]}" != ioc ] || [ "${F_SEV[$i]}" = INFO ]; then continue; fi
 		case ${F_STAT[$i]} in
 		IOC) v=compromised ;;
 		CHECK) [ "$v" = clean ] && v=review ;;
